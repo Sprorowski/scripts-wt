@@ -6,5 +6,5 @@ curl -fsSL https://raw.githubusercontent.com/Sprorowski/scripts-wt/main/install.
 ---
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Sprorowski/scripts-wt/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Sprorowski/scripts-wt/mac/install.sh | bash
 ```
