@@ -218,7 +218,7 @@ setup_env_files() {
   if [[ -f "$REPO_ROOT/apps/api/.env" ]]; then
     cp "$REPO_ROOT/apps/api/.env" "$api_env"
     if grep -q "^PORT=" "$api_env"; then
-      sed -i "s/^PORT=.*/PORT=$api_port/" "$api_env"
+      sed -i '' "s/^PORT=.*/PORT=$api_port/" "$api_env"
     else
       echo "PORT=$api_port" >> "$api_env"
     fi
@@ -228,7 +228,7 @@ setup_env_files() {
       local wt_db
       wt_db=$(wt_db_name "$wt_name")
       if grep -q "^DATABASE_URL_TEST=" "$api_env"; then
-        sed -i "s|^DATABASE_URL_TEST=.*|DATABASE_URL_TEST=postgres://rec:dbpwd123@localhost:5432/$wt_db|" "$api_env"
+        sed -i '' "s|^DATABASE_URL_TEST=.*|DATABASE_URL_TEST=postgres://rec:dbpwd123@localhost:5432/$wt_db|" "$api_env"
       else
         echo "DATABASE_URL_TEST=postgres://rec:dbpwd123@localhost:5432/$wt_db" >> "$api_env"
       fi
@@ -244,9 +244,9 @@ setup_env_files() {
   local web_env="$wt_path/apps/web/.env"
   if [[ -f "$REPO_ROOT/apps/web/.env" ]]; then
     cp "$REPO_ROOT/apps/web/.env" "$web_env"
-    sed -i "s|^NEXT_PUBLIC_API_URL=.*|NEXT_PUBLIC_API_URL=http://localhost:$api_port|" "$web_env"
+    sed -i '' "s|^NEXT_PUBLIC_API_URL=.*|NEXT_PUBLIC_API_URL=http://localhost:$api_port|" "$web_env"
     if grep -q "^WEB_PORT=" "$web_env"; then
-      sed -i "s/^WEB_PORT=.*/WEB_PORT=$web_port/" "$web_env"
+      sed -i '' "s/^WEB_PORT=.*/WEB_PORT=$web_port/" "$web_env"
     else
       echo "WEB_PORT=$web_port" >> "$web_env"
     fi
@@ -258,7 +258,7 @@ setup_env_files() {
   # E2E .env
   if [[ -f "$REPO_ROOT/apps/e2e/.env" ]]; then
     cp "$REPO_ROOT/apps/e2e/.env" "$wt_path/apps/e2e/.env"
-    sed -i "s|^NEXT_PUBLIC_API_URL=.*|NEXT_PUBLIC_API_URL=http://localhost:$api_port|" "$wt_path/apps/e2e/.env"
+    sed -i '' "s|^NEXT_PUBLIC_API_URL=.*|NEXT_PUBLIC_API_URL=http://localhost:$api_port|" "$wt_path/apps/e2e/.env"
   fi
 }
 
@@ -352,132 +352,14 @@ setup_claude_code_settings() {
 open_desktop_workspace() {
   local wt_path="$1"
   local web_port="$2"
-  local term_wid="${3:-}"   # pre-captured by caller before any focus change
-  local use_new_desktop="${4:-true}"  # false = open in caller's current workspace
-
-  [[ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] && return 0
-
-  # Fall back to active window if caller didn't supply one
-  [[ -z "$term_wid" ]] && term_wid=$(xdotool getactivewindow 2>/dev/null || echo "")
-
-  local target_desktop
-  if [[ "$use_new_desktop" == "true" ]]; then
-    # Record the new workspace index before creating it (xdotool uses 0-based index)
-    target_desktop=$(xdotool get_num_desktops 2>/dev/null || echo "1")
-
-    gdbus call --session \
-      --dest org.gnome.Shell \
-      --object-path /org/gnome/Shell \
-      --method org.gnome.Shell.Eval \
-      "let wm = global.workspace_manager; wm.append_new_workspace(false, global.get_current_time());" \
-      &>/dev/null || { warn "Could not create workspace (is GNOME running?)"; return 0; }
-
-    sleep 0.3
-
-    # Switch to the new workspace (set_desktop is reliable on X11; gdbus flag was show_desktop not switch)
-    xdotool set_desktop "$target_desktop" 2>/dev/null || true
-
-    sleep 0.3
-  else
-    # Use the workspace the calling terminal is already on
-    if [[ -n "$term_wid" ]]; then
-      target_desktop=$(xdotool get_desktop_for_window "$term_wid" 2>/dev/null || xdotool get_desktop 2>/dev/null || echo "0")
-    else
-      target_desktop=$(xdotool get_desktop 2>/dev/null || echo "0")
-    fi
-  fi
 
   local url="http://localhost:$web_port"
-  [[ "$web_port" == "0" ]] && url="about:blank"
+  [[ "$web_port" == "0" ]] && return 0
 
-  if [[ -n "${DISPLAY:-}" ]] && command -v xdotool &>/dev/null; then
-    # Detect monitor geometry
-    local primary_geom secondary_geom
-    primary_geom=$(xrandr --query 2>/dev/null \
-      | awk '/ connected primary /{match($0,/[0-9]+x[0-9]+\+[0-9]+\+[0-9]+/); print substr($0,RSTART,RLENGTH); exit}')
-    secondary_geom=$(xrandr --query 2>/dev/null \
-      | awk '/connected/ && !/primary/{match($0,/[0-9]+x[0-9]+\+[0-9]+\+[0-9]+/); if(RSTART>0){print substr($0,RSTART,RLENGTH); exit}}')
+  code "$wt_path" &>/dev/null &
+  open -a "Safari" "$url" &>/dev/null &
 
-    local pw ph px py half_w
-    pw=$(echo "$primary_geom" | cut -dx -f1)
-    ph=$(echo "$primary_geom" | cut -dx -f2 | cut -d+ -f1)
-    px=$(echo "$primary_geom" | cut -d+ -f2)
-    py=$(echo "$primary_geom" | cut -d+ -f3)
-    half_w=$(( pw / 2 ))
-
-    # Brave target: full secondary only — skip Brave on single-monitor
-    local bx by bw bh has_secondary=false
-    if [[ -n "$secondary_geom" ]]; then
-      has_secondary=true
-      bw=$(echo "$secondary_geom" | cut -dx -f1)
-      bh=$(echo "$secondary_geom" | cut -dx -f2 | cut -d+ -f1)
-      bx=$(echo "$secondary_geom" | cut -d+ -f2)
-      by=$(echo "$secondary_geom" | cut -d+ -f3)
-    fi
-
-    # Snapshot existing windows before launching so we can detect the NEW ones
-    local before_code before_brave
-    before_code=$(xdotool search --class "Code" 2>/dev/null || echo "")
-    before_brave=$(xdotool search --class "Brave-browser" 2>/dev/null || echo "")
-
-    # Poll until a window appears whose ID was not in the before-snapshot
-    _wt_wait_new_win() {
-      local class="$1" before="$2"
-      local elapsed=0
-      while [[ $elapsed -lt 30 ]]; do
-        sleep 0.5
-        elapsed=$(( elapsed + 1 ))
-        local wid
-        for wid in $(xdotool search --class "$class" 2>/dev/null || true); do
-          echo "$before" | tr ' ' '\n' | grep -qx "$wid" || { echo "$wid"; return 0; }
-        done
-      done
-      return 1
-    }
-
-    # Launch VSCode always; Brave only on dual-monitor
-    code "$wt_path" &
-    $has_secondary && brave-browser --new-window "$url" &>/dev/null &
-
-    # Move terminal to the target workspace and position it on left half of primary
-    if [[ -n "$term_wid" ]]; then
-      [[ "$use_new_desktop" == "true" ]] && xdotool set_desktop_for_window "$term_wid" "$target_desktop" 2>/dev/null || true
-      xdotool windowunmaximize "$term_wid" 2>/dev/null || true
-      xdotool windowmove "$term_wid" "$px" "$py" 2>/dev/null || true
-      xdotool windowsize "$term_wid" "$half_w" "$ph" 2>/dev/null || true
-    fi
-
-    # Wait for the new VSCode window, move it to the target workspace, then position it
-    local code_wid
-    code_wid=$(_wt_wait_new_win "Code" "$before_code") || true
-    if [[ -n "$code_wid" ]]; then
-      xdotool set_desktop_for_window "$code_wid" "$target_desktop" 2>/dev/null || true
-      xdotool windowactivate --sync "$code_wid" 2>/dev/null || true
-      xdotool windowunmaximize "$code_wid" 2>/dev/null || true
-      xdotool windowmove "$code_wid" $(( px + half_w )) "$py" 2>/dev/null || true
-      xdotool windowsize "$code_wid" "$half_w" "$ph" 2>/dev/null || true
-    fi
-
-    # Wait for the new Brave window and position it on secondary (dual-monitor only)
-    if $has_secondary; then
-      local brave_wid
-      brave_wid=$(_wt_wait_new_win "Brave-browser" "$before_brave") || true
-      if [[ -n "$brave_wid" ]]; then
-        xdotool set_desktop_for_window "$brave_wid" "$target_desktop" 2>/dev/null || true
-        xdotool windowunmaximize "$brave_wid" 2>/dev/null || true
-        xdotool windowmove "$brave_wid" "$bx" "$by" 2>/dev/null || true
-        xdotool windowsize "$brave_wid" "$bw" "$bh" 2>/dev/null || true
-      fi
-      ok "Desktop ready — Terminal+VSCode on primary (${pw}×${ph}), Brave on secondary"
-    else
-      ok "Desktop ready — Terminal+VSCode split on primary (${pw}×${ph}), no secondary monitor"
-    fi
-  else
-    # Wayland: just launch apps
-    code "$wt_path" &
-    brave-browser --new-window "$url" &>/dev/null &
-    ok "Workspace opened — arrange windows manually (Super+T for Pop Shell tiling)"
-  fi
+  ok "Workspace opened (VSCode + Brave Browser)"
 }
 
 # ── tmux Session ─────────────────────────────────────────────
@@ -531,11 +413,6 @@ cmd_create() {
   require_cmd git
   require_cmd pnpm
   ensure_config
-
-  # Capture terminal window now, before anything shifts focus
-  local desktop_term_wid=""
-  [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] && \
-    desktop_term_wid=$(xdotool getactivewindow 2>/dev/null || echo "")
 
   local branch=""
   local base=""
@@ -617,7 +494,7 @@ cmd_create() {
 
   # Create and start tmux session; desktop setup runs in background so we don't block
   create_tmux_session "$name" "$wt_path" "$api_port" "$web_port" "$branch"
-  open_desktop_workspace "$wt_path" "$web_port" "$desktop_term_wid" &
+  open_desktop_workspace "$wt_path" "$web_port" &
   echo $! > "$WT_CONFIG_DIR/desktop_bg_$name.pid"
 
   # Update terminal tab title to the worktree name
@@ -668,11 +545,6 @@ cmd_list() {
 cmd_switch() {
   ensure_config
 
-  # Capture terminal window before tmux switches focus away from it
-  local desktop_term_wid=""
-  [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] && \
-    desktop_term_wid=$(xdotool getactivewindow 2>/dev/null || echo "")
-
   local name="${1:-}"
 
   # No arg: fzf picker over worktree sessions
@@ -715,7 +587,7 @@ cmd_switch() {
   IFS='|' read -r _ _ _path _ _web <<< "$entry"
 
   # Background so tmux attach/switch happens immediately; desktop setup follows async
-  open_desktop_workspace "$_path" "$_web" "$desktop_term_wid" "false" &
+  open_desktop_workspace "$_path" "$_web" &
   echo $! > "$WT_CONFIG_DIR/desktop_bg_$name.pid"
 
   # Update terminal tab title to the worktree name

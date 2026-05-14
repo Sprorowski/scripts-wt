@@ -2,7 +2,7 @@
 set -euo pipefail
 
 INSTALL_DIR="$HOME/.local/bin"
-GITHUB_RAW="https://raw.githubusercontent.com/Sprorowski/scripts-wt/main"
+GITHUB_RAW="https://raw.githubusercontent.com/Sprorowski/scripts-wt/mac"
 SCRIPTS=(tmux-sessionizer wt)
 
 # ── Tool dependency check ─────────────────────────────────────
@@ -11,11 +11,7 @@ REQUIRED_TOOLS=(
   fzf
   git
   pnpm
-  xdotool
-  xrandr
-  gdbus
   code
-  brave-browser
   claude
   gt
   jq
@@ -33,18 +29,14 @@ if [[ ${#missing[@]} -gt 0 ]]; then
   done
   echo ""
   echo "Install hints:"
-  echo "  tmux          → sudo apt install tmux"
-  echo "  fzf           → sudo apt install fzf"
-  echo "  git           → sudo apt install git"
-  echo "  pnpm          → npm install -g pnpm  OR  https://pnpm.io/installation"
-  echo "  xdotool       → sudo apt install xdotool"
-  echo "  xrandr        → sudo apt install x11-xserver-utils"
-  echo "  gdbus         → sudo apt install dbus (usually pre-installed on GNOME)"
-  echo "  code          → https://code.visualstudio.com/docs/setup/linux"
-  echo "  brave-browser → https://brave.com/linux/"
+  echo "  tmux          → brew install tmux"
+  echo "  fzf           → brew install fzf"
+  echo "  git           → brew install git"
+  echo "  pnpm          → brew install pnpm  OR  https://pnpm.io/installation"
+  echo "  code          → https://code.visualstudio.com  (install shell command via Command Palette)"
   echo "  claude        → https://claude.ai/code  (Claude Code CLI)"
   echo "  gt            → npm install -g @withgraphite/graphite-cli"
-  echo "  jq            → sudo apt install jq"
+  echo "  jq            → brew install jq"
   echo ""
   echo "Re-run this script after installing missing tools."
   exit 1
