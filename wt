@@ -1,0 +1,1245 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ─────────────────────────────────────────────────────────────
+# wt — Git worktree manager with tmux + dev servers
+#
+# Works with any git repo. Creates isolated worktrees, each
+# with its own tmux session running dedicated dev servers on
+# unique ports. Config stored in ~/.config/wt/<repo>/
+# ─────────────────────────────────────────────────────────────
+
+# ── Repo Detection ───────────────────────────────────────────
+detect_repo() {
+  # Always resolve to the MAIN worktree (not the current one) so the registry
+  # is shared across all worktrees. `git worktree list --porcelain` always
+  # prints the main worktree first.
+  local main_root
+  main_root="$(git worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2; exit}')" \
+    || die "Not in a git repository"
+  [[ -z "$main_root" ]] && die "Not in a git repository"
+  REPO_ROOT="$main_root"
+  REPO_NAME="$(basename "$REPO_ROOT")"
+  WT_CONFIG_DIR="$HOME/.config/wt/$REPO_NAME"
+  REGISTRY_FILE="$WT_CONFIG_DIR/registry"
+  WORKTREES_PARENT="$(dirname "$REPO_ROOT")"
+
+  BASE_API_PORT=8080
+  BASE_WEB_PORT=3000
+}
+
+# ── Colors ───────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+DIM='\033[2m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+info()  { echo -e "${BLUE}>${NC} $*"; }
+ok()    { echo -e "${GREEN}✓${NC} $*"; }
+warn()  { echo -e "${YELLOW}!${NC} $*"; }
+err()   { echo -e "${RED}x${NC} $*" >&2; }
+die()   { err "$@"; exit 1; }
+
+# ── Prerequisites ────────────────────────────────────────────
+require_cmd() {
+  command -v "$1" &>/dev/null || die "'$1' is required but not installed."
+}
+
+# ── Config / Registry ───────────────────────────────────────
+ensure_config() {
+  mkdir -p "$WT_CONFIG_DIR"
+  touch "$REGISTRY_FILE"
+}
+
+# Registry format: name|branch|path|api_port|web_port
+registry_add() {
+  echo "$1|$2|$3|$4|$5" >> "$REGISTRY_FILE"
+}
+
+registry_remove() {
+  local tmp
+  tmp=$(grep -v "^$1|" "$REGISTRY_FILE" 2>/dev/null || true)
+  echo "$tmp" > "$REGISTRY_FILE"
+}
+
+registry_get() {
+  grep "^$1|" "$REGISTRY_FILE" 2>/dev/null || true
+}
+
+registry_list() {
+  cat "$REGISTRY_FILE" 2>/dev/null | grep -v '^$' || true
+}
+
+registry_names() {
+  registry_list | cut -d'|' -f1
+}
+
+# ── Port Allocation ─────────────────────────────────────────
+allocate_ports() {
+  local slot=1
+  while true; do
+    local api_port=$((BASE_API_PORT + slot))
+    local web_port=$((BASE_WEB_PORT + slot))
+    if ! grep -q "|${api_port}|${web_port}$" "$REGISTRY_FILE" 2>/dev/null; then
+      echo "$api_port $web_port"
+      return
+    fi
+    slot=$((slot + 1))
+  done
+}
+
+# ── Name Helpers ─────────────────────────────────────────────
+name_from_branch() {
+  local branch="$1"
+  # Strip remote prefix, directory prefix, and leading date patterns
+  branch="${branch##*/}"
+  branch="$(echo "$branch" | sed 's/^[0-9]*-[0-9]*-//')"
+  echo "$branch"
+}
+
+session_name() {
+  echo "wt/$1"
+}
+
+# ── Per-Worktree Test Database ──────────────────────────────
+# Creates an isolated test database per worktree using PostgreSQL
+# TEMPLATE — clones the migrated rec-test DB in ~1 second.
+# This enables parallel test execution across worktrees.
+
+wt_db_name() {
+  local name="$1"
+  # Sanitize: replace dashes with underscores (PG identifiers)
+  echo "rec_test_wt_${name//-/_}"
+}
+
+setup_test_database() {
+  local name="$1"
+  local db_name
+  db_name=$(wt_db_name "$name")
+  local template_db="rec-test"
+
+  # Parse credentials from main repo .env
+  local db_url
+  db_url=$(grep "^DATABASE_URL_TEST=" "$REPO_ROOT/apps/api/.env" 2>/dev/null | head -1 | sed 's/^DATABASE_URL_TEST=//' | sed 's/ *#.*//')
+  if [[ -z "$db_url" ]]; then
+    db_url="postgres://rec:dbpwd123@localhost:5432/rec-test"
+  fi
+  # Extract user, password, host, port from URL
+  local db_user db_pass db_host db_port
+  db_user=$(echo "$db_url" | sed 's|postgres://\([^:]*\):.*|\1|')
+  db_pass=$(echo "$db_url" | sed 's|postgres://[^:]*:\([^@]*\)@.*|\1|')
+  db_host=$(echo "$db_url" | sed 's|.*@\([^:]*\):.*|\1|')
+  db_port=$(echo "$db_url" | sed 's|.*:\([0-9]*\)/.*|\1|')
+  template_db=$(echo "$db_url" | sed 's|.*/\([^ ]*\)|\1|')
+  export PGPASSWORD="$db_pass"
+
+  # Check if postgres is reachable
+  if ! psql -h "$db_host" -p "$db_port" -U "$db_user" -d postgres -c "SELECT 1" &>/dev/null; then
+    warn "PostgreSQL not reachable — skipping test DB setup"
+    return 1
+  fi
+
+  local psql_cmd="psql -h $db_host -p $db_port -U $db_user"
+
+  # Check if template exists and has been migrated
+  if ! $psql_cmd -d "$template_db" -c "SELECT 1" &>/dev/null; then
+    warn "Template database '$template_db' not found — run migrations on rec-test first"
+    return 1
+  fi
+
+  # Drop if already exists (stale from previous run)
+  $psql_cmd -d postgres -c "DROP DATABASE IF EXISTS \"$db_name\"" &>/dev/null
+
+  # Terminate connections to template (required for TEMPLATE to work)
+  $psql_cmd -d postgres -c "
+    SELECT pg_terminate_backend(pid)
+    FROM pg_stat_activity
+    WHERE datname = '$template_db' AND pid <> pg_backend_pid()
+  " &>/dev/null
+
+  # Clone from template
+  if $psql_cmd -d postgres -c "CREATE DATABASE \"$db_name\" TEMPLATE \"$template_db\"" &>/dev/null; then
+    ok "Test database '${CYAN}$db_name${NC}' created from template '$template_db'"
+    return 0
+  else
+    warn "Failed to create test database '$db_name'"
+    return 1
+  fi
+}
+
+teardown_test_database() {
+  local name="$1"
+  local db_name
+  db_name=$(wt_db_name "$name")
+
+  # Parse credentials
+  local db_url
+  db_url=$(grep "^DATABASE_URL_TEST=" "$REPO_ROOT/apps/api/.env" 2>/dev/null | head -1 | sed 's/^DATABASE_URL_TEST=//' | sed 's/ *#.*//')
+  if [[ -z "$db_url" ]]; then
+    db_url="postgres://rec:dbpwd123@localhost:5432/rec-test"
+  fi
+  local db_user db_pass db_host db_port
+  db_user=$(echo "$db_url" | sed 's|postgres://\([^:]*\):.*|\1|')
+  db_pass=$(echo "$db_url" | sed 's|postgres://[^:]*:\([^@]*\)@.*|\1|')
+  db_host=$(echo "$db_url" | sed 's|.*@\([^:]*\):.*|\1|')
+  db_port=$(echo "$db_url" | sed 's|.*:\([0-9]*\)/.*|\1|')
+  export PGPASSWORD="$db_pass"
+  local psql_cmd="psql -h $db_host -p $db_port -U $db_user"
+
+  if ! $psql_cmd -d postgres -c "SELECT 1" &>/dev/null; then
+    return 0  # PG not running, nothing to clean
+  fi
+
+  # Terminate connections first
+  $psql_cmd -d postgres -c "
+    SELECT pg_terminate_backend(pid)
+    FROM pg_stat_activity
+    WHERE datname = '$db_name' AND pid <> pg_backend_pid()
+  " &>/dev/null
+
+  if $psql_cmd -d postgres -c "DROP DATABASE IF EXISTS \"$db_name\"" &>/dev/null; then
+    ok "Test database '$db_name' dropped"
+  fi
+}
+
+# ── Env File Setup ──────────────────────────────────────────
+setup_env_files() {
+  local wt_path="$1"
+  local api_port="$2"
+  local web_port="$3"
+  local wt_name="${4:-}"
+
+  # API .env — copy from main repo, patch port and test DB
+  local api_env="$wt_path/apps/api/.env"
+  if [[ -f "$REPO_ROOT/apps/api/.env" ]]; then
+    cp "$REPO_ROOT/apps/api/.env" "$api_env"
+    if grep -q "^PORT=" "$api_env"; then
+      sed -i "s/^PORT=.*/PORT=$api_port/" "$api_env"
+    else
+      echo "PORT=$api_port" >> "$api_env"
+    fi
+
+    # Patch DATABASE_URL_TEST for per-worktree isolation
+    if [[ -n "$wt_name" ]]; then
+      local wt_db
+      wt_db=$(wt_db_name "$wt_name")
+      if grep -q "^DATABASE_URL_TEST=" "$api_env"; then
+        sed -i "s|^DATABASE_URL_TEST=.*|DATABASE_URL_TEST=postgres://rec:dbpwd123@localhost:5432/$wt_db|" "$api_env"
+      else
+        echo "DATABASE_URL_TEST=postgres://rec:dbpwd123@localhost:5432/$wt_db" >> "$api_env"
+      fi
+      ok "API .env configured (PORT=$api_port, TEST_DB=$wt_db)"
+    else
+      ok "API .env configured (PORT=$api_port)"
+    fi
+  else
+    warn "No apps/api/.env in main repo to copy"
+  fi
+
+  # Web .env — copy from main repo, patch API URL and port
+  local web_env="$wt_path/apps/web/.env"
+  if [[ -f "$REPO_ROOT/apps/web/.env" ]]; then
+    cp "$REPO_ROOT/apps/web/.env" "$web_env"
+    sed -i "s|^NEXT_PUBLIC_API_URL=.*|NEXT_PUBLIC_API_URL=http://localhost:$api_port|" "$web_env"
+    if grep -q "^WEB_PORT=" "$web_env"; then
+      sed -i "s/^WEB_PORT=.*/WEB_PORT=$web_port/" "$web_env"
+    else
+      echo "WEB_PORT=$web_port" >> "$web_env"
+    fi
+    ok "Web .env configured (WEB_PORT=$web_port, API->$api_port)"
+  else
+    warn "No apps/web/.env in main repo to copy"
+  fi
+
+  # E2E .env
+  if [[ -f "$REPO_ROOT/apps/e2e/.env" ]]; then
+    cp "$REPO_ROOT/apps/e2e/.env" "$wt_path/apps/e2e/.env"
+    sed -i "s|^NEXT_PUBLIC_API_URL=.*|NEXT_PUBLIC_API_URL=http://localhost:$api_port|" "$wt_path/apps/e2e/.env"
+  fi
+}
+
+# ── Symlink Tool Configs ────────────────────────────────────
+# Symlinks gitignored config files (Claude, editor, etc.) from
+# the main repo so tools work identically across worktrees.
+setup_tool_configs() {
+  local wt_path="$1"
+
+  # List of gitignored files/dirs to symlink
+  local items=(".claude" "CLAUDE.md" ".mcp.json" ".cursor" ".vscode")
+
+  for item in "${items[@]}"; do
+    local src="$REPO_ROOT/$item"
+    local dst="$wt_path/$item"
+
+    # Skip if source doesn't exist in main repo
+    [[ ! -e "$src" ]] && continue
+
+    # Remove existing target (file, dir, or broken symlink) in worktree
+    if [[ -e "$dst" || -L "$dst" ]]; then
+      rm -rf "$dst"
+    fi
+
+    ln -s "$src" "$dst"
+  done
+
+  # Hide the symlinks from `git status` so worktrees stay clean.
+  # - Tracked paths (e.g. CLAUDE.md when the repo checks in a real file):
+  #   `update-index --skip-worktree` so local typechanges don't show up.
+  # - Untracked paths (.claude, .vscode, ...): append to the per-worktree
+  #   exclude file (repo-level .gitignore can't cover these because symlinks
+  #   block `.claude/*` matching and trailing-slash patterns skip symlinks).
+  local exclude_file
+  exclude_file="$(git -C "$wt_path" rev-parse --git-path info/exclude 2>/dev/null)" || exclude_file=""
+
+  for item in "${items[@]}"; do
+    [[ ! -L "$wt_path/$item" ]] && continue
+
+    if git -C "$wt_path" ls-files --error-unmatch "$item" >/dev/null 2>&1; then
+      git -C "$wt_path" update-index --skip-worktree "$item" 2>/dev/null || true
+    elif [[ -n "$exclude_file" ]]; then
+      mkdir -p "$(dirname "$exclude_file")"
+      touch "$exclude_file"
+      grep -qxF "/$item" "$exclude_file" || printf '/%s\n' "$item" >> "$exclude_file"
+    fi
+  done
+
+  ok "Tool configs symlinked (.claude, CLAUDE.md, etc.)"
+}
+
+# ── Claude Code Project Settings ───────────────────────────────
+# Claude Code stores per-project settings (permissions, auto-accepts,
+# MCP server config) at ~/.claude/projects/<path-encoded>/
+# This clones the main repo's settings into the new worktree's
+# project directory so accepted permissions carry over.
+setup_claude_code_settings() {
+  local wt_path="$1"
+
+  local claude_projects_dir="$HOME/.claude/projects"
+  [[ -d "$claude_projects_dir" ]] || return 0
+
+  # Encode paths: replace / with - and strip leading -
+  local src_key
+  src_key=$(echo "$REPO_ROOT" | tr '/' '-')
+  local src_dir="$claude_projects_dir/$src_key"
+
+  local dst_key
+  dst_key=$(echo "$wt_path" | tr '/' '-')
+  local dst_dir="$claude_projects_dir/$dst_key"
+
+  [[ -d "$src_dir" ]] || return 0
+
+  mkdir -p "$dst_dir"
+
+  # Copy settings files (settings.local.json, etc.) but not session data
+  for f in "$src_dir"/settings*.json; do
+    [[ -f "$f" ]] || continue
+    cp "$f" "$dst_dir/"
+  done
+
+  # Copy memory directory if it exists
+  if [[ -d "$src_dir/memory" ]]; then
+    cp -r "$src_dir/memory" "$dst_dir/"
+  fi
+
+  ok "Claude Code settings cloned to worktree project"
+}
+
+# ── Desktop Workspace ────────────────────────────────────────
+open_desktop_workspace() {
+  local wt_path="$1"
+  local web_port="$2"
+  local term_wid="${3:-}"   # pre-captured by caller before any focus change
+  local use_new_desktop="${4:-true}"  # false = open in caller's current workspace
+
+  [[ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] && return 0
+
+  # Fall back to active window if caller didn't supply one
+  [[ -z "$term_wid" ]] && term_wid=$(xdotool getactivewindow 2>/dev/null || echo "")
+
+  local target_desktop
+  if [[ "$use_new_desktop" == "true" ]]; then
+    # Record the new workspace index before creating it (xdotool uses 0-based index)
+    target_desktop=$(xdotool get_num_desktops 2>/dev/null || echo "1")
+
+    gdbus call --session \
+      --dest org.gnome.Shell \
+      --object-path /org/gnome/Shell \
+      --method org.gnome.Shell.Eval \
+      "let wm = global.workspace_manager; wm.append_new_workspace(false, global.get_current_time());" \
+      &>/dev/null || { warn "Could not create workspace (is GNOME running?)"; return 0; }
+
+    sleep 0.3
+
+    # Switch to the new workspace (set_desktop is reliable on X11; gdbus flag was show_desktop not switch)
+    xdotool set_desktop "$target_desktop" 2>/dev/null || true
+
+    sleep 0.3
+  else
+    # Use the workspace the calling terminal is already on
+    if [[ -n "$term_wid" ]]; then
+      target_desktop=$(xdotool get_desktop_for_window "$term_wid" 2>/dev/null || xdotool get_desktop 2>/dev/null || echo "0")
+    else
+      target_desktop=$(xdotool get_desktop 2>/dev/null || echo "0")
+    fi
+  fi
+
+  local url="http://localhost:$web_port"
+  [[ "$web_port" == "0" ]] && url="about:blank"
+
+  if [[ -n "${DISPLAY:-}" ]] && command -v xdotool &>/dev/null; then
+    # Detect monitor geometry
+    local primary_geom secondary_geom
+    primary_geom=$(xrandr --query 2>/dev/null \
+      | awk '/ connected primary /{match($0,/[0-9]+x[0-9]+\+[0-9]+\+[0-9]+/); print substr($0,RSTART,RLENGTH); exit}')
+    secondary_geom=$(xrandr --query 2>/dev/null \
+      | awk '/connected/ && !/primary/{match($0,/[0-9]+x[0-9]+\+[0-9]+\+[0-9]+/); if(RSTART>0){print substr($0,RSTART,RLENGTH); exit}}')
+
+    local pw ph px py half_w
+    pw=$(echo "$primary_geom" | cut -dx -f1)
+    ph=$(echo "$primary_geom" | cut -dx -f2 | cut -d+ -f1)
+    px=$(echo "$primary_geom" | cut -d+ -f2)
+    py=$(echo "$primary_geom" | cut -d+ -f3)
+    half_w=$(( pw / 2 ))
+
+    # Brave target: full secondary only — skip Brave on single-monitor
+    local bx by bw bh has_secondary=false
+    if [[ -n "$secondary_geom" ]]; then
+      has_secondary=true
+      bw=$(echo "$secondary_geom" | cut -dx -f1)
+      bh=$(echo "$secondary_geom" | cut -dx -f2 | cut -d+ -f1)
+      bx=$(echo "$secondary_geom" | cut -d+ -f2)
+      by=$(echo "$secondary_geom" | cut -d+ -f3)
+    fi
+
+    # Snapshot existing windows before launching so we can detect the NEW ones
+    local before_code before_brave
+    before_code=$(xdotool search --class "Code" 2>/dev/null || echo "")
+    before_brave=$(xdotool search --class "Brave-browser" 2>/dev/null || echo "")
+
+    # Poll until a window appears whose ID was not in the before-snapshot
+    _wt_wait_new_win() {
+      local class="$1" before="$2"
+      local elapsed=0
+      while [[ $elapsed -lt 30 ]]; do
+        sleep 0.5
+        elapsed=$(( elapsed + 1 ))
+        local wid
+        for wid in $(xdotool search --class "$class" 2>/dev/null || true); do
+          echo "$before" | tr ' ' '\n' | grep -qx "$wid" || { echo "$wid"; return 0; }
+        done
+      done
+      return 1
+    }
+
+    # Launch VSCode always; Brave only on dual-monitor
+    code "$wt_path" &
+    $has_secondary && brave-browser --new-window "$url" &>/dev/null &
+
+    # Move terminal to the target workspace and position it on left half of primary
+    if [[ -n "$term_wid" ]]; then
+      [[ "$use_new_desktop" == "true" ]] && xdotool set_desktop_for_window "$term_wid" "$target_desktop" 2>/dev/null || true
+      xdotool windowunmaximize "$term_wid" 2>/dev/null || true
+      xdotool windowmove "$term_wid" "$px" "$py" 2>/dev/null || true
+      xdotool windowsize "$term_wid" "$half_w" "$ph" 2>/dev/null || true
+    fi
+
+    # Wait for the new VSCode window, move it to the target workspace, then position it
+    local code_wid
+    code_wid=$(_wt_wait_new_win "Code" "$before_code") || true
+    if [[ -n "$code_wid" ]]; then
+      xdotool set_desktop_for_window "$code_wid" "$target_desktop" 2>/dev/null || true
+      xdotool windowactivate --sync "$code_wid" 2>/dev/null || true
+      xdotool windowunmaximize "$code_wid" 2>/dev/null || true
+      xdotool windowmove "$code_wid" $(( px + half_w )) "$py" 2>/dev/null || true
+      xdotool windowsize "$code_wid" "$half_w" "$ph" 2>/dev/null || true
+    fi
+
+    # Wait for the new Brave window and position it on secondary (dual-monitor only)
+    if $has_secondary; then
+      local brave_wid
+      brave_wid=$(_wt_wait_new_win "Brave-browser" "$before_brave") || true
+      if [[ -n "$brave_wid" ]]; then
+        xdotool set_desktop_for_window "$brave_wid" "$target_desktop" 2>/dev/null || true
+        xdotool windowunmaximize "$brave_wid" 2>/dev/null || true
+        xdotool windowmove "$brave_wid" "$bx" "$by" 2>/dev/null || true
+        xdotool windowsize "$brave_wid" "$bw" "$bh" 2>/dev/null || true
+      fi
+      ok "Desktop ready — Terminal+VSCode on primary (${pw}×${ph}), Brave on secondary"
+    else
+      ok "Desktop ready — Terminal+VSCode split on primary (${pw}×${ph}), no secondary monitor"
+    fi
+  else
+    # Wayland: just launch apps
+    code "$wt_path" &
+    brave-browser --new-window "$url" &>/dev/null &
+    ok "Workspace opened — arrange windows manually (Super+T for Pop Shell tiling)"
+  fi
+}
+
+# ── tmux Session ─────────────────────────────────────────────
+create_tmux_session() {
+  local name="$1"
+  local wt_path="$2"
+  local api_port="$3"
+  local web_port="$4"
+  local branch="$5"
+  local sess
+  sess=$(session_name "$name")
+
+  # Kill existing session if any
+  tmux kill-session -t "=$sess" 2>/dev/null || true
+
+  # Window 1: shell
+  tmux new-session -d -s "$sess" -c "$wt_path" -n "shell"
+
+  # Set environment variables so panes know their context
+  tmux set-environment -t "=$sess" WT_API_PORT "$api_port"
+  tmux set-environment -t "=$sess" WT_WEB_PORT "$web_port"
+  tmux set-environment -t "=$sess" WT_BRANCH "$branch"
+  tmux set-environment -t "=$sess" WT_NAME "$name"
+
+  # Window 2: claude code
+  tmux new-window -t "=$sess" -n "claude" -c "$wt_path"
+  tmux send-keys -t "=$sess:claude" "claude" Enter
+
+  # Window 3: VS Code (--wait blocks; Ctrl-C closes the editor)
+  tmux new-window -t "=$sess" -n "vscode" -c "$wt_path"
+  tmux send-keys -t "=$sess:vscode" "code ." Enter
+
+  # Window 4: API server (command pre-typed but not executed)
+  tmux new-window -t "=$sess" -n "api" -c "$wt_path"
+  tmux send-keys -t "=$sess:api" "pnpm --filter @rec/api dev"
+
+  # Window 5: Web server (command pre-typed but not executed)
+  tmux new-window -t "=$sess" -n "web" -c "$wt_path"
+  tmux send-keys -t "=$sess:web" "WEB_PORT=$web_port pnpm --filter @rec/web dev"
+
+  # Start on shell window
+  tmux select-window -t "=$sess:shell"
+
+  ok "tmux session '${CYAN}$sess${NC}' started (shell, claude, vscode, api, web) — api/web commands pre-typed, press Enter to start"
+}
+
+# ── Commands ─────────────────────────────────────────────────
+
+cmd_create() {
+  require_cmd tmux
+  require_cmd git
+  require_cmd pnpm
+  ensure_config
+
+  # Capture terminal window now, before anything shifts focus
+  local desktop_term_wid=""
+  [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] && \
+    desktop_term_wid=$(xdotool getactivewindow 2>/dev/null || echo "")
+
+  local branch=""
+  local base=""
+  local name=""
+  local new_branch=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -b|--base)   base="$2"; shift 2 ;;
+      -n|--name)   name="$2"; shift 2 ;;
+      --new)       new_branch=true; shift ;;
+      -h|--help)   cmd_help; return ;;
+      -*)          die "Unknown option: $1" ;;
+      *)           branch="$1"; shift ;;
+    esac
+  done
+
+  [[ -z "$branch" ]] && die "Usage: wt create <branch> [-b <base>] [-n <name>] [--new]"
+
+  # Derive name from branch if not provided
+  [[ -z "$name" ]] && name=$(name_from_branch "$branch")
+
+  # Check for duplicate name
+  if [[ -n "$(registry_get "$name")" ]]; then
+    die "Worktree '$name' already exists. Use 'wt remove $name' first or pick a different --name."
+  fi
+
+  # Allocate ports
+  local ports
+  ports=$(allocate_ports)
+  local api_port web_port
+  api_port=$(echo "$ports" | cut -d' ' -f1)
+  web_port=$(echo "$ports" | cut -d' ' -f2)
+
+  local wt_path="$WORKTREES_PARENT/wt-$name"
+
+  info "Creating worktree ${BOLD}$name${NC}"
+  echo -e "  Branch:   ${CYAN}$branch${NC}"
+  echo -e "  Path:     ${DIM}$wt_path${NC}"
+  echo -e "  API port: ${GREEN}$api_port${NC}"
+  echo -e "  Web port: ${GREEN}$web_port${NC}"
+  echo ""
+
+  # Create the worktree
+  if [[ "$new_branch" == true ]]; then
+    local actual_base="${base:-main}"
+    info "Creating new branch '$branch' from '$actual_base'"
+    git -C "$REPO_ROOT" worktree add -b "$branch" "$wt_path" "$actual_base"
+  elif [[ -n "$base" ]]; then
+    info "Creating new branch '$branch' from '$base'"
+    git -C "$REPO_ROOT" worktree add -b "$branch" "$wt_path" "$base"
+  else
+    # Check if branch exists
+    if git -C "$REPO_ROOT" rev-parse --verify "$branch" &>/dev/null; then
+      git -C "$REPO_ROOT" worktree add "$wt_path" "$branch"
+    else
+      die "Branch '$branch' does not exist. Use --new to create it, or -b <base> to branch from a specific commit."
+    fi
+  fi
+  ok "Worktree created at $wt_path"
+
+  # Setup .env files and tool configs
+  setup_env_files "$wt_path" "$api_port" "$web_port" "$name"
+  setup_tool_configs "$wt_path"
+  setup_claude_code_settings "$wt_path"
+
+  # Create isolated test database
+  setup_test_database "$name" || true
+
+  # Install dependencies
+  info "Installing dependencies (pnpm install)..."
+  (cd "$wt_path" && pnpm install --frozen-lockfile 2>&1 | tail -5) || {
+    warn "pnpm install had issues — you may need to run it manually"
+  }
+  ok "Dependencies installed"
+
+  # Register the worktree
+  registry_add "$name" "$branch" "$wt_path" "$api_port" "$web_port"
+
+  # Create and start tmux session; desktop setup runs in background so we don't block
+  create_tmux_session "$name" "$wt_path" "$api_port" "$web_port" "$branch"
+  open_desktop_workspace "$wt_path" "$web_port" "$desktop_term_wid" &
+  echo $! > "$WT_CONFIG_DIR/desktop_bg_$name.pid"
+
+  # Update terminal tab title to the worktree name
+  printf '\033]0;wt/%s\007' "$name"
+
+  echo ""
+  echo -e "${GREEN}${BOLD}Worktree ready!${NC}"
+  echo -e "  Switch to it:  ${CYAN}wt switch $name${NC}  or  ${CYAN}Ctrl-b s${NC}"
+  echo -e "  List all:      ${CYAN}wt list${NC}  or  ${CYAN}Ctrl-b w${NC}"
+}
+
+cmd_list() {
+  ensure_config
+
+  local entries
+  entries=$(registry_list)
+
+  # Header — main repo
+  echo ""
+  echo -e "${BOLD}Worktrees${NC} ${DIM}($REPO_NAME)${NC}"
+  echo -e "${DIM}──────────────────────────────────────────────────────────────${NC}"
+
+  # Main repo info
+  local main_branch
+  main_branch=$(git -C "$REPO_ROOT" branch --show-current 2>/dev/null || echo "unknown")
+  printf "  ${CYAN}%-20s${NC} %-30s API:${GREEN}%-6s${NC} Web:${GREEN}%-6s${NC} %s\n" \
+    "(main repo)" "$main_branch" "$BASE_API_PORT" "$BASE_WEB_PORT" "$REPO_ROOT"
+
+  echo -e "${DIM}──────────────────────────────────────────────────────────────${NC}"
+
+  if [[ -z "$entries" ]]; then
+    echo -e "  ${DIM}No worktrees. Use 'wt create <branch>' to add one.${NC}"
+  else
+    while IFS='|' read -r name branch path api_port web_port; do
+      local status="${RED}stopped${NC}"
+      local sess
+      sess=$(session_name "$name")
+      if tmux has-session -t "=$sess" 2>/dev/null; then
+        status="${GREEN}running${NC}"
+      fi
+      printf "  ${CYAN}%-20s${NC} %-30s API:${GREEN}%-6s${NC} Web:${GREEN}%-6s${NC} [%b]\n" \
+        "$name" "$branch" "$api_port" "$web_port" "$status"
+    done <<< "$entries"
+  fi
+  echo ""
+}
+
+cmd_switch() {
+  ensure_config
+
+  # Capture terminal window before tmux switches focus away from it
+  local desktop_term_wid=""
+  [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] && \
+    desktop_term_wid=$(xdotool getactivewindow 2>/dev/null || echo "")
+
+  local name="${1:-}"
+
+  # No arg: fzf picker over worktree sessions
+  if [[ -z "$name" ]]; then
+    require_cmd fzf
+    local sessions
+    sessions=$(registry_names)
+    if [[ -z "$sessions" ]]; then
+      cmd_list
+      die "No worktrees to switch to."
+    fi
+    name=$(echo "$sessions" | fzf --prompt="worktree > " --height=10 --reverse) || return 0
+  fi
+
+  # Allow switching to main repo
+  if [[ "$name" == "main" || "$name" == "repo" ]]; then
+    if [[ -n "${TMUX:-}" ]]; then
+      warn "You're in tmux — navigate to your main session manually or detach first."
+    else
+      echo -e "Main repo is at: ${CYAN}$REPO_ROOT${NC}"
+    fi
+    return
+  fi
+
+  local entry
+  entry=$(registry_get "$name")
+  [[ -z "$entry" ]] && die "Worktree '$name' not found. Run 'wt list' to see available worktrees."
+
+  local sess
+  sess=$(session_name "$name")
+
+  if ! tmux has-session -t "=$sess" 2>/dev/null; then
+    local branch path api_port web_port
+    IFS='|' read -r _ branch path api_port web_port <<< "$entry"
+    warn "Session not running. Restarting..."
+    create_tmux_session "$name" "$path" "$api_port" "$web_port" "$branch"
+  fi
+
+  local _path _web
+  IFS='|' read -r _ _ _path _ _web <<< "$entry"
+
+  # Background so tmux attach/switch happens immediately; desktop setup follows async
+  open_desktop_workspace "$_path" "$_web" "$desktop_term_wid" "false" &
+  echo $! > "$WT_CONFIG_DIR/desktop_bg_$name.pid"
+
+  # Update terminal tab title to the worktree name
+  printf '\033]0;wt/%s\007' "$name"
+
+  if [[ -n "${TMUX:-}" ]]; then
+    tmux switch-client -t "=$sess"
+  else
+    tmux attach-session -t "=$sess"
+  fi
+}
+
+cmd_remove() {
+  ensure_config
+
+  local name="${1:-}"
+  [[ -z "$name" ]] && die "Usage: wt remove <name>"
+
+  local entry
+  entry=$(registry_get "$name")
+  [[ -z "$entry" ]] && die "Worktree '$name' not found."
+
+  local branch path api_port web_port
+  IFS='|' read -r _ branch path api_port web_port <<< "$entry"
+
+  info "Removing worktree '$name'"
+
+  kill_desktop_bg "$name"
+
+  # Kill tmux session
+  local sess
+  sess=$(session_name "$name")
+  if tmux kill-session -t "=$sess" 2>/dev/null; then
+    ok "tmux session killed"
+  fi
+
+  # Remove git worktree
+  if [[ -d "$path" ]]; then
+    git -C "$REPO_ROOT" worktree remove --force "$path" 2>/dev/null || {
+      warn "git worktree remove failed — cleaning up manually"
+      rm -rf "$path"
+    }
+    ok "Worktree directory removed"
+  fi
+
+  # Drop isolated test database
+  teardown_test_database "$name"
+
+  # Prune stale worktree references
+  git -C "$REPO_ROOT" worktree prune 2>/dev/null
+
+  # Remove from registry
+  registry_remove "$name"
+  ok "Removed from registry"
+
+  echo -e "${GREEN}Worktree '$name' fully removed.${NC} Ports $api_port/$web_port freed."
+}
+
+cmd_restart() {
+  ensure_config
+
+  local name="${1:-}"
+  [[ -z "$name" ]] && die "Usage: wt restart <name>"
+
+  local entry
+  entry=$(registry_get "$name")
+  [[ -z "$entry" ]] && die "Worktree '$name' not found."
+
+  local branch path api_port web_port
+  IFS='|' read -r _ branch path api_port web_port <<< "$entry"
+
+  info "Restarting servers for '$name'"
+  create_tmux_session "$name" "$path" "$api_port" "$web_port" "$branch"
+}
+
+kill_desktop_bg() {
+  local name="$1"
+  local pid_file="$WT_CONFIG_DIR/desktop_bg_$name.pid"
+  if [[ -f "$pid_file" ]]; then
+    kill "$(cat "$pid_file")" 2>/dev/null || true
+    rm -f "$pid_file"
+  fi
+}
+
+cmd_stop() {
+  ensure_config
+
+  local name="${1:-}"
+  [[ -z "$name" ]] && die "Usage: wt stop <name>"
+
+  kill_desktop_bg "$name"
+
+  local sess
+  sess=$(session_name "$name")
+  if tmux kill-session -t "=$sess" 2>/dev/null; then
+    ok "Session '$sess' stopped"
+  else
+    warn "Session '$sess' was not running"
+  fi
+}
+
+cmd_supervise() {
+  require_cmd tmux
+  require_cmd git
+  require_cmd claude
+  ensure_config
+
+  local stack_arg="${1:-current}"
+
+  # Determine the bottom branch of the stack for worktree creation
+  local bottom_branch
+  if [[ "$stack_arg" == "current" ]]; then
+    bottom_branch=$(gt log short --stack 2>/dev/null | sed 's/[◯◉│ ]*//' | sed 's/ (.*)//' | grep -v '^main$' | grep -v '^$' | tail -1)
+  elif [[ "$stack_arg" =~ ^[0-9]+$ ]]; then
+    # PR number — get branch
+    bottom_branch=$(gh pr view "$stack_arg" --json headRefName -q '.headRefName' 2>/dev/null) || die "Could not find PR #$stack_arg"
+  else
+    bottom_branch="$stack_arg"
+  fi
+
+  [[ -z "$bottom_branch" ]] && die "Could not determine stack branch. Are you in a Graphite stack?"
+
+  # Derive name from the stack (e.g., "03-16-custom-tables/01-migrations" → "sv-custom-tables")
+  local stack_prefix
+  stack_prefix=$(echo "$bottom_branch" | sed 's|/.*||' | sed 's/^[0-9]*-[0-9]*-//')
+  local name="sv-${stack_prefix}"
+
+  # Check if already running for this stack
+  if [[ -n "$(registry_get "$name")" ]]; then
+    local sess
+    sess=$(session_name "$name")
+    if tmux has-session -t "=$sess" 2>/dev/null; then
+      echo ""
+      echo -e "${YELLOW}PR Supervisor for '${stack_prefix}' is already running!${NC}"
+      echo -e "  Attach:  ${CYAN}wt switch $name${NC}"
+      echo -e "  Kill:    ${CYAN}wt remove $name${NC}"
+      echo ""
+      return 1
+    else
+      # Registered but session dead — clean up and recreate
+      warn "Stale session found. Cleaning up..."
+      cmd_remove "$name" 2>/dev/null || true
+    fi
+  fi
+
+  local wt_path="$WORKTREES_PARENT/wt-$name"
+
+  info "Launching PR Supervisor ${BOLD}$name${NC}"
+  echo -e "  Stack:    ${CYAN}$stack_arg${NC}"
+  echo -e "  Branch:   ${CYAN}$bottom_branch${NC}"
+  echo -e "  Path:     ${DIM}$wt_path${NC}"
+  echo -e "  Session:  ${CYAN}wt switch $name${NC}"
+  echo ""
+
+  # Prune stale worktree references (e.g., manually deleted directories)
+  git -C "$REPO_ROOT" worktree prune 2>/dev/null
+
+  # Detach HEAD in main repo to free all branches for the worktree
+  local original_branch
+  original_branch=$(git -C "$REPO_ROOT" branch --show-current 2>/dev/null || echo "")
+  if [[ -n "$original_branch" ]]; then
+    info "Detaching HEAD in main repo (freeing branches for worktree)..."
+    git -C "$REPO_ROOT" checkout --detach 2>/dev/null
+  fi
+
+  # Create the worktree
+  git -C "$REPO_ROOT" worktree add "$wt_path" "$bottom_branch" 2>/dev/null || {
+    # Restore branch on failure
+    [[ -n "$original_branch" ]] && git -C "$REPO_ROOT" checkout "$original_branch" 2>/dev/null
+    die "Failed to create worktree"
+  }
+  ok "Worktree created"
+
+  # Symlink tool configs and setup env/DB
+  setup_tool_configs "$wt_path"
+  setup_env_files "$wt_path" "0" "0" "$name"
+  setup_test_database "$name" || true
+
+  # Register (use 0/0 for ports since no dev servers)
+  registry_add "$name" "$bottom_branch" "$wt_path" "0" "0"
+
+  # Build prompt file with inlined SKILL.md (skills don't work in -p mode)
+  local log_dir="/tmp/pr-supervisor-logs"
+  local log_file="$log_dir/$(date +%Y%m%d_%H%M%S).log"
+  mkdir -p "$log_dir"
+
+  local skill_scripts="$REPO_ROOT/.agents/skills/pr-supervisor/scripts"
+  local skill_md="$REPO_ROOT/.agents/skills/pr-supervisor/SKILL.md"
+  local prompt_file="/tmp/pr-supervisor-prompt-$$.md"
+  local runner_script="/tmp/pr-supervisor-runner-$$.sh"
+
+  # Build the prompt: guardrails + full SKILL.md content + execution trigger
+  cat > "$prompt_file" <<PROMPT_EOF
+You are running in AUTONOMOUS MODE with permissions bypassed. SAFETY GUARDRAILS ARE CRITICAL.
+
+ABSOLUTE RESTRICTIONS (violations = immediate termination):
+- NEVER delete files outside the worktree (no rm -rf, no git clean on main repo)
+- NEVER modify .claude/, .git/config, .gitconfig, or any CLI configuration
+- NEVER run destructive git commands on the main repo (reset --hard, clean -f, push --force to main)
+- NEVER modify settings files (.claude/settings.local.json, .env, credentials, secrets)
+- NEVER access or modify files outside of: the worktree, styleguide/, and the skill scripts directory
+- NEVER install global packages, modify system files, or change shell configuration
+- NEVER run curl/wget to download or upload anything
+- NEVER interact with external services other than GitHub API (via gh) and Graphite CLI (via gt)
+- NEVER modify or delete other branches not in the target stack
+- ONLY use Edit/Write tools on files inside the worktree path
+- ONLY use Bash for: gt commands, gh api, gh pr, git (in worktree), pnpm (in worktree), and the skill scripts
+
+WORKTREE PATH: $wt_path
+ORIGINAL BRANCH: ${original_branch:-detached}
+REPO ROOT: $REPO_ROOT
+
+When done (success or stuck), restore the main repo branch:
+  cd $REPO_ROOT && git checkout ${original_branch:-main}
+
+---
+
+CRITICAL EXECUTION RULES:
+1. You MUST follow the skill instructions below from start to finish.
+2. You MUST loop through Phase 1 → Phase 2 → Phase 3 repeatedly until a termination condition is met.
+3. You MUST NOT stop after fixing just one error or completing one iteration. After each Phase 3, check if there are remaining unresolved Sentry comments or new ones appeared. If yes, go back to Phase 1.
+4. You MUST NOT write a summary or final response until you have hit a termination condition (SUCCESS or circuit breaker).
+5. Keep calling tools. Every response you give should include at least one tool call until you are truly done.
+6. After pushing with gt submit, you MUST wait for CI to fully complete (poll gh pr checks until all checks are terminal), then wait 2 minutes, then re-scan ALL PRs for new Sentry comments. NEVER terminate just because you resolved all comments from your scan — Sentry posts NEW comments after each push. Only terminate when CI is green AND re-scan shows zero new unresolved comments.
+7. The stack argument is: $stack_arg
+
+$(cat "$skill_md")
+PROMPT_EOF
+
+  # Build runner script (avoids heredoc-in-tmux issues)
+  cat > "$runner_script" <<RUNNER_EOF
+#!/usr/bin/env bash
+cd "$wt_path"
+echo "=== PR Supervisor started at \$(date) ==="
+echo "Log: $log_file"
+echo ""
+# DISABLE_OMC prevents oh-my-claudecode hooks from intercepting the prompt
+# stream-json gives real-time tool call visibility; debug-file captures full debug log
+DISABLE_OMC=1 claude -p --dangerously-skip-permissions --verbose --output-format stream-json --debug-file "${log_file%.log}-debug.log" "\$(cat '$prompt_file')" 2>&1 | tee "$log_file"
+echo ""
+echo "=== PR Supervisor ended at \$(date) ==="
+echo "Restoring branch..."
+cd "$REPO_ROOT" && git checkout "${original_branch:-main}" 2>/dev/null
+rm -f "$prompt_file" "$runner_script"
+echo "Press Enter to close..."
+read
+RUNNER_EOF
+  chmod +x "$runner_script"
+
+  # Create tmux session
+  local sess
+  sess=$(session_name "$name")
+  tmux kill-session -t "=$sess" 2>/dev/null || true
+
+  # Window 1: Claude running pr-supervisor via runner script
+  tmux new-session -d -s "$sess" -c "$wt_path" -n "claude"
+  tmux set-environment -t "=$sess" WT_NAME "$name"
+  tmux set-environment -t "=$sess" WT_BRANCH "$bottom_branch"
+  tmux send-keys -t "=$sess:claude" "$runner_script" Enter
+
+  # Window 2: shell for manual inspection
+  tmux new-window -t "=$sess" -n "shell" -c "$wt_path"
+
+  # Window 3: live status dashboard (refreshes every 30s)
+  tmux new-window -t "=$sess" -n "status" -c "$wt_path"
+  tmux send-keys -t "=$sess:status" "watch -n 10 -c 'wt status $name'" Enter
+
+  # Window 4: stream log (tool calls in real-time)
+  tmux new-window -t "=$sess" -n "logs" -c "$wt_path"
+  tmux send-keys -t "=$sess:logs" "sleep 2 && tail -f '$log_file' | jq -r 'if .type == \"assistant\" then \"\\n>>> ASSISTANT: \" + (.message.content // \"\" | tostring) elif .type == \"tool_use\" then \"\\n[TOOL] \" + .name + \": \" + (.input // {} | tostring | .[0:200]) elif .type == \"tool_result\" then \"[RESULT] \" + (.content // \"\" | tostring | .[0:300]) elif .type == \"result\" then \"\\n=== DONE ===\"  else empty end' 2>/dev/null || tail -f '$log_file'" Enter
+
+  # Window 5: debug log
+  local debug_log="${log_file%.log}-debug.log"
+  tmux new-window -t "=$sess" -n "debug" -c "$wt_path"
+  tmux send-keys -t "=$sess:debug" "sleep 2 && tail -f '$debug_log'" Enter
+
+  # Start on claude window
+  tmux select-window -t "=$sess:claude"
+
+  ok "tmux session '${CYAN}$sess${NC}' started (claude, shell, logs)"
+
+  # Desktop notification
+  if [[ -x "$skill_scripts/notify.sh" ]]; then
+    "$skill_scripts/notify.sh" progress "PR Supervisor: Launched" "Stack: $stack_arg | wt switch $name"
+  fi
+
+  echo ""
+  echo -e "${GREEN}${BOLD}PR Supervisor ($name) is running!${NC}"
+  echo -e "  Watch live:   ${CYAN}wt switch $name${NC}"
+  echo -e "  View logs:    ${CYAN}tail -f $log_file${NC}"
+  echo -e "  Stop:         ${CYAN}wt remove $name${NC}"
+  echo -e "  List all:     ${CYAN}wt list${NC}"
+  echo ""
+}
+
+cmd_status() {
+  set +o pipefail  # Sentry comment queries use pipes that may SIGPIPE
+
+  # If we're inside a worktree, detect_repo finds the worktree as REPO_ROOT.
+  # Override to find the main repo's registry by checking all config dirs.
+  detect_repo 2>/dev/null || true
+  if [[ ! -s "$REGISTRY_FILE" ]]; then
+    # Try finding registry from any known config dir
+    for dir in "$HOME/.config/wt"/*/; do
+      if [[ -s "${dir}registry" ]]; then
+        WT_CONFIG_DIR="${dir%/}"
+        REGISTRY_FILE="$WT_CONFIG_DIR/registry"
+        REPO_NAME="$(basename "$WT_CONFIG_DIR")"
+        break
+      fi
+    done
+  fi
+  ensure_config
+
+  local name="${1:-}"
+
+  # If no name given, find supervisor sessions
+  if [[ -z "$name" ]]; then
+    local supervisors
+    supervisors=$(registry_names | grep '^sv-' || true)
+    if [[ -z "$supervisors" ]]; then
+      die "No supervisor sessions running. Launch one with 'wt supervise'."
+    fi
+    # If only one, use it; otherwise list them
+    local count
+    count=$(echo "$supervisors" | wc -l)
+    if [[ "$count" -eq 1 ]]; then
+      name="$supervisors"
+    else
+      echo ""
+      echo -e "${BOLD}Active supervisors:${NC}"
+      echo "$supervisors" | while read -r s; do echo -e "  ${CYAN}$s${NC}"; done
+      echo ""
+      die "Multiple supervisors running. Specify one: wt status <name>"
+    fi
+  fi
+
+  local entry
+  entry=$(registry_get "$name")
+  [[ -z "$entry" ]] && die "Supervisor '$name' not found. Run 'wt list' to see worktrees."
+
+  local branch path
+  IFS='|' read -r _ branch path _ _ <<< "$entry"
+
+  # Session alive?
+  local sess
+  sess=$(session_name "$name")
+  local running=false
+  if tmux has-session -t "=$sess" 2>/dev/null; then
+    running=true
+  fi
+
+  # Find the session JSONL file
+  local project_dir="$HOME/.claude/projects/-home-dev-workspace-$(basename "$path")"
+  local session_file
+  session_file=$(ls -t "$project_dir"/*.jsonl 2>/dev/null | head -1)
+
+  echo ""
+  echo -e "${BOLD}PR Supervisor Status: ${CYAN}$name${NC}"
+  echo -e "${DIM}──────────────────────────────────────────────────────────────${NC}"
+  echo -e "  Branch:    ${CYAN}$branch${NC}"
+  echo -e "  Path:      ${DIM}$path${NC}"
+  echo -e "  Session:   $(if $running; then echo -e "${GREEN}running${NC}"; else echo -e "${RED}stopped${NC}"; fi)"
+
+  if [[ -n "$session_file" ]]; then
+    local msg_count
+    msg_count=$(wc -l < "$session_file")
+    echo -e "  Messages:  $msg_count"
+  fi
+
+  # Git commits in worktree
+  echo ""
+  echo -e "${BOLD}Recent Commits${NC}"
+  if [[ -d "$path" ]]; then
+    git -C "$path" log --oneline --since="2 hours ago" 2>/dev/null | head -10 | while read -r line; do
+      echo -e "  ${GREEN}$line${NC}"
+    done
+    local commit_count
+    commit_count=$(git -C "$path" log --oneline --since="2 hours ago" 2>/dev/null | wc -l)
+    [[ "$commit_count" -eq 0 ]] && echo -e "  ${DIM}(no commits yet)${NC}"
+  fi
+
+  # Latest tool calls from session
+  if [[ -n "$session_file" ]]; then
+    echo ""
+    echo -e "${BOLD}Latest Activity${NC}"
+    tail -30 "$session_file" | grep '"tool_use"' | tail -5 | jq -r '
+      "  \(.message.content[0].name) → " + (.message.content[0].input | tostring | .[0:100])
+    ' 2>/dev/null || echo -e "  ${DIM}(no tool calls yet)${NC}"
+  fi
+
+  # Sentry comment progress (if gh is available)
+  if command -v gh &>/dev/null; then
+    # Extract owner/repo from registry branch info
+    local owner repo
+    local info_output
+    info_output=$(cd "$path" 2>/dev/null && gt branch info "$branch" 2>/dev/null || true)
+    owner=$(echo "$info_output" | grep 'graphite.com/github/pr' | sed 's|.*github/pr/\([^/]*\)/\([^/]*\)/.*|\1|' || true)
+    repo=$(echo "$info_output" | grep 'graphite.com/github/pr' | sed 's|.*github/pr/\([^/]*\)/\([^/]*\)/.*|\2|' || true)
+
+    if [[ -n "$owner" && -n "$repo" ]]; then
+      echo ""
+      echo -e "${BOLD}Sentry Comments${NC}"
+      # Get all PRs in the stack (use the worktree cwd for gt)
+      local branches
+      branches=$(cd "$path" 2>/dev/null && gt log short --stack 2>/dev/null | sed 's/[◯◉│ ]*//' | sed 's/ (.*)//' | grep -v '^main$' | grep -v '^$' || true)
+      local total_resolved=0 total_sentry=0
+      while read -r b; do
+        [[ -z "$b" ]] && continue
+        local pr_num
+        pr_num=$(cd "$path" 2>/dev/null && gt branch info "$b" 2>/dev/null | grep '^PR #' | sed 's/PR #\([0-9]*\).*/\1/' || true)
+        [[ -z "$pr_num" ]] && continue
+        local resolved sentry
+        # Fetch all comments once, count sentry total and resolved
+        # Resolved = body starts with "*Resolved" (Sentry auto) OR has reply from supervisor (thread resolved via script)
+        local comments_json
+        comments_json=$(gh api "repos/$owner/$repo/pulls/$pr_num/comments" --paginate 2>/dev/null || echo "[]")
+        sentry=$(echo "$comments_json" | jq '[.[] | select(.user.login == "sentry[bot]")] | length' 2>/dev/null || echo 0)
+        # Get IDs of sentry comments that have replies (resolved by supervisor)
+        local replied_ids
+        replied_ids=$(echo "$comments_json" | jq -r '[.[] | select(.user.login != "sentry[bot]" and .in_reply_to_id != null)] | [.[].in_reply_to_id] | unique | .[]' 2>/dev/null || echo "")
+        # Count: auto-resolved (body) + supervisor-replied (not already auto-resolved)
+        resolved=$(echo "$comments_json" | jq --argjson replied "$(echo "$replied_ids" | jq -R -s 'split("\n") | map(select(. != "") | tonumber)' 2>/dev/null || echo "[]")" \
+          '[.[] | select(.user.login == "sentry[bot]" and ((.body | startswith("*Resolved")) or (.id as $id | $replied | index($id) != null)))] | length' 2>/dev/null || echo 0)
+        total_sentry=$((total_sentry + sentry))
+        total_resolved=$((total_resolved + resolved))
+        local remaining=$((sentry - resolved))
+        if [[ "$remaining" -gt 0 ]]; then
+          printf "  PR #%-6s ${GREEN}%s${NC}/${YELLOW}%s${NC} resolved (%s remaining)\n" "$pr_num" "$resolved" "$sentry" "$remaining"
+        else
+          printf "  PR #%-6s ${GREEN}%s/%s resolved ✓${NC}\n" "$pr_num" "$resolved" "$sentry"
+        fi
+      done <<< "$branches"
+      echo -e "${DIM}──────────────────────────────────────────────────────────────${NC}"
+      local total_remaining=$((total_sentry - total_resolved))
+      echo -e "  Total: ${GREEN}$total_resolved${NC}/${YELLOW}$total_sentry${NC} resolved, ${BOLD}$total_remaining remaining${NC}"
+    fi
+  fi
+  echo ""
+  set -o pipefail  # Restore
+}
+
+cmd_help() {
+  echo ""
+  echo -e "${BOLD}wt${NC} — Git worktree manager with tmux + dev servers"
+  echo ""
+  echo -e "${BOLD}USAGE${NC}"
+  echo "  wt <command> [options]"
+  echo ""
+  echo -e "${BOLD}COMMANDS${NC}"
+  echo -e "  ${CYAN}create${NC} <branch> [opts]   Create worktree + tmux session with dev servers"
+  echo "        -b, --base <ref>     Create new branch from <ref>"
+  echo "        -n, --name <name>    Override the worktree name"
+  echo "        --new                Create branch from main (shorthand for -b main)"
+  echo ""
+  echo -e "  ${CYAN}list${NC}    (ls)              List all worktrees with ports and status"
+  echo -e "  ${CYAN}switch${NC}  (s)  [name]       Switch to worktree (fzf picker if no name)"
+  echo -e "  ${CYAN}remove${NC}  (rm) <name>       Stop servers and remove worktree"
+  echo -e "  ${CYAN}restart${NC}      <name>       Restart dev servers for a worktree"
+  echo -e "  ${CYAN}stop${NC}         <name>       Stop dev servers (keep worktree)"
+  echo -e "  ${CYAN}supervise${NC}    [stack]       Launch PR Supervisor (autonomous Sentry fixer)"
+  echo -e "  ${CYAN}status${NC}  (st)  [name]       Show PR Supervisor progress (commits, Sentry comments)"
+  echo -e "  ${CYAN}help${NC}                      Show this help"
+  echo ""
+  echo -e "${BOLD}EXAMPLES${NC}"
+  echo "  wt create feature/payments           # Existing branch"
+  echo "  wt create fix/login-bug --new        # New branch from main"
+  echo "  wt create fix/login -b develop       # New branch from develop"
+  echo "  wt switch                            # fzf picker"
+  echo "  wt switch login-bug                  # Direct switch"
+  echo "  wt list                              # See all worktrees"
+  echo "  wt remove login-bug                  # Tear everything down"
+  echo "  wt supervise                         # Fix Sentry errors on current stack"
+  echo "  wt supervise 03-16-custom-tables     # Fix specific stack"
+  echo "  wt supervise 6517                    # Fix stack containing PR #6517"
+  echo ""
+  echo -e "${BOLD}PORTS${NC}"
+  echo "  Main repo:       API=$BASE_API_PORT  Web=$BASE_WEB_PORT"
+  echo "  Each worktree gets the next available port pair (8081/3001, 8082/3002, ...)"
+  echo ""
+  echo -e "${BOLD}TMUX${NC}"
+  echo "  Each worktree gets a tmux session 'wt/<name>' with windows:"
+  echo "    1:shell  2:claude  3:vscode  4:api  5:web"
+  echo ""
+  echo -e "  ${CYAN}Ctrl-b w${NC}     Window picker (all sessions — best for jumping around)"
+  echo -e "  ${CYAN}Ctrl-b s${NC}     Session picker"
+  echo -e "  ${CYAN}Ctrl-b 1-5${NC}   Switch window (vscode/claude/shell/api/web)"
+  echo -e "  ${CYAN}Alt-[${NC}        Previous session"
+  echo -e "  ${CYAN}Alt-]${NC}        Next session"
+  echo -e "  ${CYAN}Ctrl-b L${NC}     Last (most recent) session"
+  echo -e "  ${CYAN}Ctrl-b W${NC}     Show worktree ports/status popup"
+  echo ""
+  echo -e "${BOLD}CONFIG${NC}"
+  echo "  Registry: ~/.config/wt/<repo-name>/registry"
+  echo ""
+}
+
+# ── Main ─────────────────────────────────────────────────────
+main() {
+  local cmd="${1:-help}"
+  shift || true
+
+  # help doesn't need a repo
+  if [[ "$cmd" == "help" || "$cmd" == "-h" || "$cmd" == "--help" ]]; then
+    # Provide defaults for help display
+    BASE_API_PORT=8080
+    BASE_WEB_PORT=3000
+    cmd_help
+    return
+  fi
+
+  detect_repo
+
+  case "$cmd" in
+    create)          cmd_create "$@" ;;
+    list|ls)         cmd_list ;;
+    switch|s)        cmd_switch "$@" ;;
+    remove|rm)       cmd_remove "$@" ;;
+    restart)         cmd_restart "$@" ;;
+    stop)            cmd_stop "$@" ;;
+    supervise|sv)    cmd_supervise "$@" ;;
+    status|st)       cmd_status "$@" ;;
+    *)               die "Unknown command: $cmd. Run 'wt help' for usage." ;;
+  esac
+}
+
+main "$@"
