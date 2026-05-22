@@ -1,0 +1,55 @@
+#compdef wt
+
+_wt_worktree_names() {
+  local repo_root repo_name registry names
+  repo_root=$(git worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2; exit}')
+  [[ -z "$repo_root" ]] && return
+  repo_name=$(basename "$repo_root")
+  registry="$HOME/.config/wt/$repo_name/registry"
+  [[ -f "$registry" ]] || return
+  local -a wt_names
+  while IFS='|' read -r name _; do
+    [[ -n "$name" ]] && wt_names+=("$name")
+  done < "$registry"
+  _describe 'worktrees' wt_names
+}
+
+_wt() {
+  local state
+
+  _arguments \
+    '1: :->command' \
+    '*: :->args'
+
+  case $state in
+    command)
+      local -a commands=(
+        'create:Create worktree + tmux session with dev servers'
+        'c:Create worktree + tmux session with dev servers'
+        'list:List all worktrees'
+        'ls:List all worktrees'
+        'switch:Switch to worktree (fzf if no name given)'
+        's:Switch to worktree (fzf if no name given)'
+        'remove:Stop servers and remove worktree'
+        'rm:Stop servers and remove worktree'
+        'restart:Restart dev servers for a worktree'
+        'stop:Stop dev servers (keep worktree)'
+        'supervise:Launch PR Supervisor'
+        'sv:Launch PR Supervisor'
+        'status:Show PR Supervisor progress'
+        'st:Show PR Supervisor progress'
+        'help:Show help'
+      )
+      _describe 'commands' commands
+      ;;
+    args)
+      case $words[2] in
+        switch|s|remove|rm|stop|restart|status|st)
+          _wt_worktree_names
+          ;;
+      esac
+      ;;
+  esac
+}
+
+_wt "$@"

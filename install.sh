@@ -2,6 +2,7 @@
 set -euo pipefail
 
 INSTALL_DIR="$HOME/.local/bin"
+COMPLETION_DIR="$HOME/.local/share/zsh/completions"
 GITHUB_RAW="https://raw.githubusercontent.com/Sprorowski/scripts-wt/main"
 SCRIPTS=(tmux-sessionizer wt)
 
@@ -94,6 +95,32 @@ if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
   echo "NOTE: $INSTALL_DIR is not in your PATH."
   echo "Add to ~/.bashrc or ~/.zshrc:"
   echo "  export PATH=\"\$HOME/.local/bin:\$PATH\""
+fi
+
+# ── Zsh completion ────────────────────────────────────────────
+mkdir -p "$COMPLETION_DIR"
+comp_dst="$COMPLETION_DIR/_wt"
+comp_tmp=$(mktemp)
+trap "rm -f $comp_tmp" EXIT
+
+echo "Fetching _wt completion..."
+if curl -fsSL "$GITHUB_RAW/_wt" -o "$comp_tmp" 2>/dev/null; then
+  cp "$comp_tmp" "$comp_dst"
+  echo "Installed: $comp_dst"
+else
+  echo "WARNING: Could not download _wt completion — skipping"
+fi
+
+# Add COMPLETION_DIR to fpath in .zshrc if not already present
+ZSHRC="$HOME/.zshrc"
+FPATH_LINE="fpath=(\$HOME/.local/share/zsh/completions \$fpath)"
+if [[ -f "$ZSHRC" ]] && ! grep -qF "$COMPLETION_DIR" "$ZSHRC"; then
+  echo "" >> "$ZSHRC"
+  echo "# wt completion" >> "$ZSHRC"
+  echo "$FPATH_LINE" >> "$ZSHRC"
+  echo "autoload -Uz compinit && compinit" >> "$ZSHRC"
+  echo "Added zsh completion fpath to $ZSHRC"
+  echo "Restart your shell or run: source ~/.zshrc"
 fi
 
 echo ""

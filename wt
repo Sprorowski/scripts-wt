@@ -532,11 +532,6 @@ cmd_create() {
   require_cmd pnpm
   ensure_config
 
-  # Capture terminal window now, before anything shifts focus
-  local desktop_term_wid=""
-  [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] && \
-    desktop_term_wid=$(xdotool getactivewindow 2>/dev/null || echo "")
-
   local branch=""
   local base=""
   local name=""
@@ -615,10 +610,8 @@ cmd_create() {
   # Register the worktree
   registry_add "$name" "$branch" "$wt_path" "$api_port" "$web_port"
 
-  # Create and start tmux session; desktop setup runs in background so we don't block
+  # Create and start tmux session
   create_tmux_session "$name" "$wt_path" "$api_port" "$web_port" "$branch"
-  open_desktop_workspace "$wt_path" "$web_port" "$desktop_term_wid" &
-  echo $! > "$WT_CONFIG_DIR/desktop_bg_$name.pid"
 
   # Update terminal tab title to the worktree name
   printf '\033]0;wt/%s\007' "$name"
@@ -1166,7 +1159,7 @@ cmd_help() {
   echo "  wt <command> [options]"
   echo ""
   echo -e "${BOLD}COMMANDS${NC}"
-  echo -e "  ${CYAN}create${NC} <branch> [opts]   Create worktree + tmux session with dev servers"
+  echo -e "  ${CYAN}create${NC}  (c)  <branch> [opts]   Create worktree + tmux session with dev servers"
   echo "        -b, --base <ref>     Create new branch from <ref>"
   echo "        -n, --name <name>    Override the worktree name"
   echo "        --new                Create branch from main (shorthand for -b main)"
@@ -1230,7 +1223,7 @@ main() {
   detect_repo
 
   case "$cmd" in
-    create)          cmd_create "$@" ;;
+    create|c)        cmd_create "$@" ;;
     list|ls)         cmd_list ;;
     switch|s)        cmd_switch "$@" ;;
     remove|rm)       cmd_remove "$@" ;;
