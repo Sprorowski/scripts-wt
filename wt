@@ -26,6 +26,7 @@ detect_repo() {
 
   BASE_API_PORT=8080
   BASE_WEB_PORT=3000
+  DEFAULT_ORG_ID="a976a11a-5303-4785-838a-1b281ca77678"
 }
 
 # ── Colors ───────────────────────────────────────────────────
@@ -105,15 +106,19 @@ session_name() {
   echo "wt/$1"
 }
 
-# ── Per-Worktree Test Database ──────────────────────────────
-# Creates an isolated test database per worktree using PostgreSQL
-# TEMPLATE — clones the migrated rec-test DB in ~1 second.
-# This enables parallel test execution across worktrees.
+# ── Per-Worktree Databases ───────────────────────────────────
+# Creates isolated dev and test databases per worktree using
+# PostgreSQL TEMPLATE — clones in ~1 second.
+# Migrations in one worktree won't affect other worktrees.
 
 wt_db_name() {
   local name="$1"
-  # Sanitize: replace dashes with underscores (PG identifiers)
   echo "rec_test_wt_${name//-/_}"
+}
+
+wt_dev_db_name() {
+  local name="$1"
+  echo "rec_dev_wt_${name//-/_}"
 }
 
 setup_test_database() {
@@ -203,6 +208,245 @@ teardown_test_database() {
 
   if $psql_cmd -d postgres -c "DROP DATABASE IF EXISTS \"$db_name\"" &>/dev/null; then
     ok "Test database '$db_name' dropped"
+  fi
+}
+
+# Add a 'wt' MCP server entry in ~/.claude.json for the worktree path pointing
+# at the isolated DB. Leaves postgres-local untouched so both are available.
+# Pass db_name="" to remove the entry (on dropdb).
+_patch_mcp_postgres() {
+  local wt_path="$1" db_name="$2"
+  local claude_json="$HOME/.claude.json"
+  [[ -f "$claude_json" ]] || return 0
+
+  if [[ -z "$db_name" ]]; then
+    # Remove the wt entry
+    python3 -c "
+import json
+path = '$claude_json'
+d = json.load(open(path))
+d.get('projects', {}).get('$wt_path', {}).get('mcpServers', {}).pop('wt', None)
+open(path, 'w').write(json.dumps(d, indent=2))
+" 2>/dev/null && ok "MCP 'wt' server removed"
+    return 0
+  fi
+
+  # Read the postgres-local template from the monorepo project entry
+  local template
+  template=$(python3 -c "
+import json
+d = json.load(open('$claude_json'))
+srv = d.get('projects', {}).get('$REPO_ROOT', {}).get('mcpServers', {}).get('postgres-local')
+if srv: print(json.dumps(srv))
+" 2>/dev/null)
+  [[ -z "$template" ]] && return 0
+
+  python3 -c "
+import json, re
+path = '$claude_json'
+d = json.load(open(path))
+srv = json.loads('''$template''')
+srv['env']['DATABASE_URI'] = re.sub(r'/[^/]+$', '/$db_name', srv['env']['DATABASE_URI'])
+d.setdefault('projects', {}).setdefault('$wt_path', {}).setdefault('mcpServers', {})['wt'] = srv
+open(path, 'w').write(json.dumps(d, indent=2))
+" 2>/dev/null && ok "MCP 'wt' → ${CYAN}$db_name${NC}"
+}
+
+# Patch DATABASE_URL in the worktree's api .env to point at the isolated DB.
+_patch_dev_db_url() {
+  local wt_path="$1" db_name="$2" source_url="$3"
+  local api_env="$wt_path/apps/api/.env"
+  [[ -f "$api_env" ]] || return 0
+  local new_url
+  new_url=$(echo "$source_url" | sed "s|/[^/]*$|/$db_name|")
+  if grep -q "^DATABASE_URL=" "$api_env"; then
+    sed -i '' "s|^DATABASE_URL=.*|DATABASE_URL=$new_url|" "$api_env"
+  else
+    echo "DATABASE_URL=$new_url" >> "$api_env"
+  fi
+  ok "DATABASE_URL → ${CYAN}$db_name${NC}"
+}
+
+# Creates an isolated dev DB for a worktree by copying schema from the source
+# DB and selectively copying data: global tables in full, org-scoped tables
+# filtered to the given org. Uses COPY for fast row-level transfer.
+setup_isolated_dev_db() {
+  local name="$1"
+  local org_id="$2"
+  local wt_path="$3"
+  local reset="${4:-false}"
+
+  local db_name
+  db_name=$(wt_dev_db_name "$name")
+
+  local db_url
+  db_url=$(grep "^DATABASE_URL=" "$REPO_ROOT/apps/api/.env" 2>/dev/null | head -1 | sed 's/^DATABASE_URL=//' | sed 's/ *#.*//')
+  [[ -z "$db_url" ]] && die "No DATABASE_URL in main repo .env"
+
+  local db_user db_pass db_host db_port source_db
+  db_user=$(echo "$db_url" | sed 's|postgres://\([^:]*\):.*|\1|')
+  db_pass=$(echo "$db_url" | sed 's|postgres://[^:]*:\([^@]*\)@.*|\1|')
+  db_host=$(echo "$db_url" | sed 's|.*@\([^:]*\):.*|\1|')
+  db_port=$(echo "$db_url" | sed 's|.*:\([0-9]*\)/.*|\1|')
+  source_db=$(echo "$db_url" | sed 's|.*/\([^/?]*\).*|\1|')
+  export PGPASSWORD="$db_pass"
+
+  local psql_pg="psql -h $db_host -p $db_port -U $db_user -d postgres"
+  local psql_src="psql -h $db_host -p $db_port -U $db_user -d $source_db"
+  local psql_dst="psql -h $db_host -p $db_port -U $db_user -d $db_name"
+
+  $psql_pg -c "SELECT 1" &>/dev/null || die "PostgreSQL not reachable"
+
+  # Drop and recreate if requested or doesn't exist
+  local db_exists
+  db_exists=$($psql_pg -t -c "SELECT 1 FROM pg_database WHERE datname='$db_name'" 2>/dev/null | tr -d ' \n')
+  if [[ "$db_exists" == "1" ]]; then
+    if [[ "$reset" == true ]]; then
+      info "Dropping existing isolated DB '$db_name'..."
+      $psql_pg -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='$db_name'" &>/dev/null
+      $psql_pg -c "DROP DATABASE \"$db_name\"" &>/dev/null
+    else
+      warn "Isolated DB '$db_name' already exists. Use --reset to recreate."
+      _patch_dev_db_url "$wt_path" "$db_name" "$db_url"
+      _patch_mcp_postgres "$wt_path" "$db_name"
+      return 0
+    fi
+  fi
+
+  info "Creating isolated dev DB '${CYAN}$db_name${NC}' (org: ${YELLOW}$org_id${NC})"
+
+  # Create empty DB and restore schema
+  $psql_pg -c "CREATE DATABASE \"$db_name\"" &>/dev/null || die "Failed to create '$db_name'"
+  info "Copying schema..."
+  PGPASSWORD="$db_pass" pg_dump -h "$db_host" -p "$db_port" -U "$db_user" \
+    --schema-only --no-owner --no-acl "$source_db" | \
+    PGPASSWORD="$db_pass" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$db_name" -q
+  ok "Schema copied"
+
+  # Discover tables: those WITH organization_id are org-scoped; rest are global
+  local org_tables global_tables
+  org_tables=$($psql_src -t -A -c "
+    SELECT table_name FROM information_schema.columns
+    WHERE table_schema='public' AND column_name='organization_id'
+    ORDER BY table_name" 2>/dev/null)
+
+  global_tables=$($psql_src -t -A -c "
+    SELECT table_name FROM information_schema.tables
+    WHERE table_schema='public' AND table_type='BASE TABLE'
+      AND table_name NOT IN (
+        SELECT table_name FROM information_schema.columns
+        WHERE table_schema='public' AND column_name='organization_id')
+    ORDER BY table_name" 2>/dev/null)
+
+  # Build column list for a table using the DESTINATION schema (avoids dropped-column
+  # ordinal gaps in the source causing "extra data after last expected column" errors).
+  _col_list() {
+    local tbl="$1"
+    PGPASSWORD="$db_pass" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$db_name" -t -A -c "
+      SELECT string_agg(quote_ident(column_name), ',' ORDER BY ordinal_position)
+      FROM information_schema.columns
+      WHERE table_schema='public' AND table_name=$(printf "'%s'" "$tbl")
+        AND is_generated = 'NEVER'" 2>/dev/null
+  }
+
+  # Copy rows — session_replication_role=replica disables FK trigger checks
+  local copied=0 skipped=0
+
+  # Copy the organization row for this org only (table has no organization_id on itself)
+  local org_cols
+  org_cols=$(_col_list "organization")
+  PGPASSWORD="$db_pass" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$source_db" \
+      -t -c "COPY (SELECT $org_cols FROM \"organization\" WHERE id='$org_id') TO STDOUT" 2>/dev/null | \
+     PGPASSWORD="$db_pass" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$db_name" \
+      -c "SET session_replication_role=replica" -c "COPY \"organization\" ($org_cols) FROM STDIN" &>/dev/null \
+    && ok "Organization row copied" || warn "Failed to copy organization row"
+
+  info "Copying global tables..."
+  while IFS= read -r table; do
+    [[ -z "$table" ]] && continue
+    [[ "$table" == "organization" ]] && continue  # handled above
+    local cols
+    cols=$(_col_list "$table")
+    [[ -z "$cols" ]] && { skipped=$((skipped + 1)); continue; }
+    if PGPASSWORD="$db_pass" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$source_db" \
+        -t -c "COPY (SELECT $cols FROM \"$table\") TO STDOUT" 2>/dev/null | \
+       PGPASSWORD="$db_pass" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$db_name" \
+        -c "SET session_replication_role=replica" -c "COPY \"$table\" ($cols) FROM STDIN" &>/dev/null; then
+      copied=$((copied + 1))
+    else
+      skipped=$((skipped + 1))
+    fi
+  done <<< "$global_tables"
+  ok "Global tables: $copied copied, $skipped skipped"
+
+  copied=0; skipped=0
+  info "Copying org-scoped tables (org=$org_id)..."
+  while IFS= read -r table; do
+    [[ -z "$table" ]] && continue
+    local cols
+    cols=$(_col_list "$table")
+    [[ -z "$cols" ]] && { skipped=$((skipped + 1)); continue; }
+    if PGPASSWORD="$db_pass" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$source_db" \
+        -t -c "COPY (SELECT $cols FROM \"$table\" WHERE organization_id='$org_id') TO STDOUT" 2>/dev/null | \
+       PGPASSWORD="$db_pass" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$db_name" \
+        -c "SET session_replication_role=replica" -c "COPY \"$table\" ($cols) FROM STDIN" &>/dev/null; then
+      copied=$((copied + 1))
+    else
+      skipped=$((skipped + 1))
+    fi
+  done <<< "$org_tables"
+  ok "Org-scoped tables: $copied copied, $skipped skipped"
+
+  # Reset all sequences so auto-increment IDs don't collide after COPY
+  info "Resetting sequences..."
+  PGPASSWORD="$db_pass" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$db_name" -t -A -c "
+    SELECT 'SELECT setval(' || quote_literal(s.sequence_schema || '.' || s.sequence_name) ||
+           ', COALESCE((SELECT MAX(' || quote_ident(c.column_name) || ') FROM ' ||
+           quote_ident(c.table_name) || '), 1));'
+    FROM information_schema.sequences s
+    JOIN information_schema.columns c
+      ON c.column_default LIKE '%' || s.sequence_name || '%'
+    WHERE s.sequence_schema = 'public'
+  " 2>/dev/null | PGPASSWORD="$db_pass" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$db_name" -q 2>/dev/null
+  ok "Sequences reset"
+
+  _patch_dev_db_url "$wt_path" "$db_name" "$db_url"
+  _patch_mcp_postgres "$wt_path" "$db_name"
+
+  echo ""
+  ok "Isolated dev DB ready: ${CYAN}$db_name${NC}"
+  echo -e "  Run migrations: ${DIM}cd $wt_path && pnpm --filter @rec/api db:migrate${NC}"
+}
+
+teardown_dev_database() {
+  local name="$1"
+  local db_name
+  db_name=$(wt_dev_db_name "$name")
+
+  local db_url
+  db_url=$(grep "^DATABASE_URL=" "$REPO_ROOT/apps/api/.env" 2>/dev/null | head -1 | sed 's/^DATABASE_URL=//' | sed 's/ *#.*//')
+  [[ -z "$db_url" ]] && return 0
+
+  local db_user db_pass db_host db_port
+  db_user=$(echo "$db_url" | sed 's|postgres://\([^:]*\):.*|\1|')
+  db_pass=$(echo "$db_url" | sed 's|postgres://[^:]*:\([^@]*\)@.*|\1|')
+  db_host=$(echo "$db_url" | sed 's|.*@\([^:]*\):.*|\1|')
+  db_port=$(echo "$db_url" | sed 's|.*:\([0-9]*\)/.*|\1|')
+  export PGPASSWORD="$db_pass"
+  local psql_cmd="psql -h $db_host -p $db_port -U $db_user"
+
+  if ! $psql_cmd -d postgres -c "SELECT 1" &>/dev/null; then
+    return 0
+  fi
+
+  $psql_cmd -d postgres -c "
+    SELECT pg_terminate_backend(pid)
+    FROM pg_stat_activity
+    WHERE datname = '$db_name' AND pid <> pg_backend_pid()
+  " &>/dev/null
+
+  if $psql_cmd -d postgres -c "DROP DATABASE IF EXISTS \"$db_name\"" &>/dev/null; then
+    ok "Dev database '$db_name' dropped"
   fi
 }
 
@@ -418,19 +662,21 @@ cmd_create() {
   local base=""
   local name=""
   local new_branch=false
+  local isolate_org=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -b|--base)   base="$2"; shift 2 ;;
       -n|--name)   name="$2"; shift 2 ;;
       --new)       new_branch=true; shift ;;
+      --org|-o)    isolate_org="$2"; shift 2 ;;
       -h|--help)   cmd_help; return ;;
       -*)          die "Unknown option: $1" ;;
       *)           branch="$1"; shift ;;
     esac
   done
 
-  [[ -z "$branch" ]] && die "Usage: wt create <branch> [-b <base>] [-n <name>] [--new]"
+  [[ -z "$branch" ]] && die "Usage: wt create <branch> [-b <base>] [-n <name>] [--new] [--org <id>]"
 
   # Derive name from branch if not provided
   [[ -z "$name" ]] && name=$(name_from_branch "$branch")
@@ -481,6 +727,11 @@ cmd_create() {
 
   # Create isolated test database
   setup_test_database "$name" || true
+
+  # Optionally create an isolated dev database for a specific org
+  if [[ -n "$isolate_org" ]]; then
+    setup_isolated_dev_db "$name" "$isolate_org" "$wt_path" false || true
+  fi
 
   # Install dependencies
   info "Installing dependencies (pnpm install)..."
@@ -633,7 +884,8 @@ cmd_remove() {
     ok "Worktree directory removed"
   fi
 
-  # Drop isolated test database
+  # Drop isolated dev and test databases
+  teardown_dev_database "$name"
   teardown_test_database "$name"
 
   # Prune stale worktree references
@@ -1030,6 +1282,124 @@ cmd_status() {
   set -o pipefail  # Restore
 }
 
+cmd_dropdb() {
+  require_cmd psql
+  ensure_config
+
+  local name=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) echo "Usage: wt dropdb [name]"; return ;;
+      -*)        die "Unknown option: $1" ;;
+      *)         name="$1"; shift ;;
+    esac
+  done
+
+  # Default to current worktree
+  if [[ -z "$name" ]]; then
+    local current_path
+    current_path=$(git rev-parse --show-toplevel 2>/dev/null) || die "Not in a git repository"
+    name=$(registry_list | while IFS='|' read -r n _ p _ _; do
+      [[ "$p" == "$current_path" ]] && echo "$n" && break
+    done)
+    [[ -z "$name" ]] && die "Not in a registered worktree. Specify a name: wt dropdb <name>"
+  fi
+
+  local entry
+  entry=$(registry_get "$name")
+  [[ -z "$entry" ]] && die "Worktree '$name' not found. Run 'wt list'."
+
+  local wt_path
+  IFS='|' read -r _ _ wt_path _ _ <<< "$entry"
+
+  local db_name
+  db_name=$(wt_dev_db_name "$name")
+
+  # Parse credentials from main repo
+  local db_url
+  db_url=$(grep "^DATABASE_URL=" "$REPO_ROOT/apps/api/.env" 2>/dev/null | head -1 | sed 's/^DATABASE_URL=//' | sed 's/ *#.*//')
+  [[ -z "$db_url" ]] && die "No DATABASE_URL in main repo .env"
+
+  local db_user db_pass db_host db_port
+  db_user=$(echo "$db_url" | sed 's|postgres://\([^:]*\):.*|\1|')
+  db_pass=$(echo "$db_url" | sed 's|postgres://[^:]*:\([^@]*\)@.*|\1|')
+  db_host=$(echo "$db_url" | sed 's|.*@\([^:]*\):.*|\1|')
+  db_port=$(echo "$db_url" | sed 's|.*:\([0-9]*\)/.*|\1|')
+  export PGPASSWORD="$db_pass"
+
+  local psql_pg="psql -h $db_host -p $db_port -U $db_user -d postgres"
+
+  $psql_pg -c "SELECT 1" &>/dev/null || die "PostgreSQL not reachable"
+
+  # Check it's actually a wt-managed DB before dropping
+  local db_exists
+  db_exists=$($psql_pg -t -c "SELECT 1 FROM pg_database WHERE datname='$db_name'" 2>/dev/null | tr -d ' \n')
+  if [[ "$db_exists" != "1" ]]; then
+    warn "No isolated DB '$db_name' found for worktree '$name'"
+    return 0
+  fi
+
+  $psql_pg -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='$db_name'" &>/dev/null
+  $psql_pg -c "DROP DATABASE \"$db_name\"" || die "Failed to drop '$db_name'"
+  ok "Dropped isolated DB '${CYAN}$db_name${NC}'"
+
+  # Restore DATABASE_URL in worktree .env back to main
+  local api_env="$wt_path/apps/api/.env"
+  if [[ -f "$api_env" ]]; then
+    sed -i '' "s|^DATABASE_URL=.*|DATABASE_URL=$db_url|" "$api_env"
+    ok "DATABASE_URL restored to main dev DB"
+  fi
+
+  # Remove the 'wt' MCP server entry from ~/.claude.json for this worktree
+  _patch_mcp_postgres "$wt_path" ""
+}
+
+cmd_isolatedb() {
+  require_cmd psql
+  require_cmd pg_dump
+  ensure_config
+
+  local name=""
+  local org_id=""
+  local reset=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --org|-o)    org_id="$2"; shift 2 ;;
+      --reset)     reset=true; shift ;;
+      -h|--help)
+        echo "Usage: wt isolatedb [name] --org <org_id> [--reset]"
+        echo "  name       Worktree name (defaults to current worktree)"
+        echo "  --org      Organization ID to scope the data copy to"
+        echo "  --reset    Drop and recreate an existing isolated DB"
+        return ;;
+      -*)          die "Unknown option: $1" ;;
+      *)           name="$1"; shift ;;
+    esac
+  done
+
+  # Default to current worktree if no name given
+  if [[ -z "$name" ]]; then
+    local current_path
+    current_path=$(git rev-parse --show-toplevel 2>/dev/null) || die "Not in a git repository"
+    name=$(registry_list | while IFS='|' read -r n _ p _ _; do
+      [[ "$p" == "$current_path" ]] && echo "$n" && break
+    done)
+    [[ -z "$name" ]] && die "Not in a registered worktree. Run 'wt list' and specify: wt isolatedb <name> --org <id>"
+  fi
+
+  [[ -z "$org_id" ]] && org_id="$DEFAULT_ORG_ID"
+
+  local entry
+  entry=$(registry_get "$name")
+  [[ -z "$entry" ]] && die "Worktree '$name' not found. Run 'wt list'."
+
+  local wt_path
+  IFS='|' read -r _ _ wt_path _ _ <<< "$entry"
+
+  setup_isolated_dev_db "$name" "$org_id" "$wt_path" "$reset"
+}
+
 cmd_help() {
   echo ""
   echo -e "${BOLD}wt${NC} — Git worktree manager with tmux + dev servers"
@@ -1050,16 +1420,24 @@ cmd_help() {
   echo -e "  ${CYAN}stop${NC}         <name>       Stop dev servers (keep worktree)"
   echo -e "  ${CYAN}supervise${NC}    [stack]       Launch PR Supervisor (autonomous Sentry fixer)"
   echo -e "  ${CYAN}status${NC}  (st)  [name]       Show PR Supervisor progress (commits, Sentry comments)"
+  echo -e "  ${CYAN}isolatedb${NC} (idb) [name]     Create isolated dev DB scoped to one org"
+  echo -e "  ${CYAN}dropdb${NC}       [name]        Drop isolated dev DB and restore shared DB URL"
+  echo "        --org, -o <id>       Org ID to copy data for (required)"
+  echo "        --reset              Drop and recreate existing isolated DB"
   echo -e "  ${CYAN}help${NC}                      Show this help"
   echo ""
   echo -e "${BOLD}EXAMPLES${NC}"
   echo "  wt create feature/payments           # Existing branch"
   echo "  wt create fix/login-bug --new        # New branch from main"
   echo "  wt create fix/login -b develop       # New branch from develop"
+  echo "  wt create migrations/v2 --org abc123 # Create + isolate DB in one step"
   echo "  wt switch                            # fzf picker"
   echo "  wt switch login-bug                  # Direct switch"
   echo "  wt list                              # See all worktrees"
   echo "  wt remove login-bug                  # Tear everything down"
+  echo "  wt isolatedb --org abc123            # Isolate current worktree's DB"
+  echo "  wt isolatedb login-bug --org abc123  # Isolate a specific worktree's DB"
+  echo "  wt isolatedb --org abc123 --reset    # Rebuild the isolated DB"
   echo "  wt supervise                         # Fix Sentry errors on current stack"
   echo "  wt supervise 03-16-custom-tables     # Fix specific stack"
   echo "  wt supervise 6517                    # Fix stack containing PR #6517"
@@ -1110,6 +1488,8 @@ main() {
     stop)            cmd_stop "$@" ;;
     supervise|sv)    cmd_supervise "$@" ;;
     status|st)       cmd_status "$@" ;;
+    isolatedb|idb)   cmd_isolatedb "$@" ;;
+    dropdb)          cmd_dropdb "$@" ;;
     *)               die "Unknown command: $cmd. Run 'wt help' for usage." ;;
   esac
 }
