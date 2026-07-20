@@ -1408,7 +1408,7 @@ cmd_help() {
   echo "  wt <command> [options]"
   echo ""
   echo -e "${BOLD}COMMANDS${NC}"
-  echo -e "  ${CYAN}create${NC} <branch> [opts]   Create worktree + tmux session with dev servers"
+  echo -e "  ${CYAN}create${NC} (c) <branch> [opts]  Create worktree + tmux session with dev servers"
   echo "        -b, --base <ref>     Create new branch from <ref>"
   echo "        -n, --name <name>    Override the worktree name"
   echo "        --new                Create branch from main (shorthand for -b main)"
@@ -1480,7 +1480,7 @@ main() {
   detect_repo
 
   case "$cmd" in
-    create)          cmd_create "$@" ;;
+    create|c)        cmd_create "$@" ;;
     list|ls)         cmd_list ;;
     switch|s)        cmd_switch "$@" ;;
     remove|rm)       cmd_remove "$@" ;;
