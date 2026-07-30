@@ -50,6 +50,50 @@ require_cmd() {
   command -v "$1" &>/dev/null || die "'$1' is required but not installed."
 }
 
+# ── Platform Compatibility ───────────────────────────────────
+# Everything below keeps macOS and Linux on the same code path.
+case "$(uname -s)" in
+  Darwin) WT_OS="macos" ;;
+  Linux)  WT_OS="linux" ;;
+  *)      WT_OS="unknown" ;;
+esac
+
+# BSD sed (macOS) requires a backup suffix after -i; GNU sed
+# (Linux) treats the next word as the script instead. Detect
+# once — only GNU sed understands --version.
+if sed --version &>/dev/null; then
+  SED_INPLACE=(sed -i)
+else
+  SED_INPLACE=(sed -i '')
+fi
+
+sed_i() { "${SED_INPLACE[@]}" "$@"; }
+
+# Open a URL in the user's browser. Override the browser with
+# WT_BROWSER (an app name on macOS, an executable on Linux).
+open_url() {
+  local url="$1"
+  case "$WT_OS" in
+    macos)
+      open -a "${WT_BROWSER:-Safari}" "$url" &>/dev/null &
+      ;;
+    linux)
+      if [[ -n "${WT_BROWSER:-}" ]] && command -v "$WT_BROWSER" &>/dev/null; then
+        "$WT_BROWSER" "$url" &>/dev/null &
+      elif command -v xdg-open &>/dev/null; then
+        xdg-open "$url" &>/dev/null &
+      else
+        warn "No xdg-open found — open $url manually"
+        return 0
+      fi
+      ;;
+    *)
+      warn "Unsupported platform — open $url manually"
+      return 0
+      ;;
+  esac
+}
+
 # ── Config / Registry ───────────────────────────────────────
 ensure_config() {
   mkdir -p "$WT_CONFIG_DIR"
@@ -260,7 +304,7 @@ _patch_dev_db_url() {
   local new_url
   new_url=$(echo "$source_url" | sed "s|/[^/]*$|/$db_name|")
   if grep -q "^DATABASE_URL=" "$api_env"; then
-    sed -i '' "s|^DATABASE_URL=.*|DATABASE_URL=$new_url|" "$api_env"
+    sed_i "s|^DATABASE_URL=.*|DATABASE_URL=$new_url|" "$api_env"
   else
     echo "DATABASE_URL=$new_url" >> "$api_env"
   fi
@@ -462,7 +506,7 @@ setup_env_files() {
   if [[ -f "$REPO_ROOT/apps/api/.env" ]]; then
     cp "$REPO_ROOT/apps/api/.env" "$api_env"
     if grep -q "^PORT=" "$api_env"; then
-      sed -i '' "s/^PORT=.*/PORT=$api_port/" "$api_env"
+      sed_i "s/^PORT=.*/PORT=$api_port/" "$api_env"
     else
       echo "PORT=$api_port" >> "$api_env"
     fi
@@ -472,7 +516,7 @@ setup_env_files() {
       local wt_db
       wt_db=$(wt_db_name "$wt_name")
       if grep -q "^DATABASE_URL_TEST=" "$api_env"; then
-        sed -i '' "s|^DATABASE_URL_TEST=.*|DATABASE_URL_TEST=postgres://rec:dbpwd123@localhost:5432/$wt_db|" "$api_env"
+        sed_i "s|^DATABASE_URL_TEST=.*|DATABASE_URL_TEST=postgres://rec:dbpwd123@localhost:5432/$wt_db|" "$api_env"
       else
         echo "DATABASE_URL_TEST=postgres://rec:dbpwd123@localhost:5432/$wt_db" >> "$api_env"
       fi
@@ -488,9 +532,9 @@ setup_env_files() {
   local web_env="$wt_path/apps/web/.env"
   if [[ -f "$REPO_ROOT/apps/web/.env" ]]; then
     cp "$REPO_ROOT/apps/web/.env" "$web_env"
-    sed -i '' "s|^NEXT_PUBLIC_API_URL=.*|NEXT_PUBLIC_API_URL=http://localhost:$api_port|" "$web_env"
+    sed_i "s|^NEXT_PUBLIC_API_URL=.*|NEXT_PUBLIC_API_URL=http://localhost:$api_port|" "$web_env"
     if grep -q "^WEB_PORT=" "$web_env"; then
-      sed -i '' "s/^WEB_PORT=.*/WEB_PORT=$web_port/" "$web_env"
+      sed_i "s/^WEB_PORT=.*/WEB_PORT=$web_port/" "$web_env"
     else
       echo "WEB_PORT=$web_port" >> "$web_env"
     fi
@@ -502,7 +546,7 @@ setup_env_files() {
   # E2E .env
   if [[ -f "$REPO_ROOT/apps/e2e/.env" ]]; then
     cp "$REPO_ROOT/apps/e2e/.env" "$wt_path/apps/e2e/.env"
-    sed -i '' "s|^NEXT_PUBLIC_API_URL=.*|NEXT_PUBLIC_API_URL=http://localhost:$api_port|" "$wt_path/apps/e2e/.env"
+    sed_i "s|^NEXT_PUBLIC_API_URL=.*|NEXT_PUBLIC_API_URL=http://localhost:$api_port|" "$wt_path/apps/e2e/.env"
   fi
 }
 
@@ -601,9 +645,9 @@ open_desktop_workspace() {
   [[ "$web_port" == "0" ]] && return 0
 
   code "$wt_path" &>/dev/null &
-  open -a "Safari" "$url" &>/dev/null &
+  open_url "$url"
 
-  ok "Workspace opened (VSCode + Brave Browser)"
+  ok "Workspace opened (VSCode + browser at $url)"
 }
 
 # ── tmux Session ─────────────────────────────────────────────
@@ -1346,7 +1390,7 @@ cmd_dropdb() {
   # Restore DATABASE_URL in worktree .env back to main
   local api_env="$wt_path/apps/api/.env"
   if [[ -f "$api_env" ]]; then
-    sed -i '' "s|^DATABASE_URL=.*|DATABASE_URL=$db_url|" "$api_env"
+    sed_i "s|^DATABASE_URL=.*|DATABASE_URL=$db_url|" "$api_env"
     ok "DATABASE_URL restored to main dev DB"
   fi
 

@@ -35,26 +35,32 @@
   "hotPaths": [
     {
       "path": "tmux-statusbar.conf",
-      "accessCount": 8,
-      "lastAccessed": 1785422091566,
-      "type": "file"
-    },
-    {
-      "path": "wt-tmux-status",
-      "accessCount": 5,
-      "lastAccessed": 1785421976415,
-      "type": "file"
-    },
-    {
-      "path": "wt",
-      "accessCount": 2,
-      "lastAccessed": 1785421048345,
+      "accessCount": 9,
+      "lastAccessed": 1785426661122,
       "type": "file"
     },
     {
       "path": "install.sh",
+      "accessCount": 8,
+      "lastAccessed": 1785426653400,
+      "type": "file"
+    },
+    {
+      "path": "wt-tmux-status",
+      "accessCount": 7,
+      "lastAccessed": 1785426825125,
+      "type": "file"
+    },
+    {
+      "path": "wt",
+      "accessCount": 6,
+      "lastAccessed": 1785426602956,
+      "type": "file"
+    },
+    {
+      "path": "README.md",
       "accessCount": 2,
-      "lastAccessed": 1785421602064,
+      "lastAccessed": 1785427042356,
       "type": "file"
     },
     {

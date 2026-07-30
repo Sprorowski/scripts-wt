@@ -5,6 +5,28 @@ INSTALL_DIR="$HOME/.local/bin"
 GITHUB_RAW="https://raw.githubusercontent.com/Sprorowski/scripts-wt/mac"
 SCRIPTS=(tmux-sessionizer wt wt-tmux-status)
 
+# ── Platform ──────────────────────────────────────────────────
+case "$(uname -s)" in
+  Darwin) OS="macos" ;;
+  Linux)  OS="linux" ;;
+  *)      echo "ERROR: unsupported platform '$(uname -s)'"; exit 1 ;;
+esac
+
+# Package-manager hint used in the "missing tools" message.
+if [[ "$OS" == "macos" ]]; then
+  PKG="brew install"
+elif command -v apt-get &>/dev/null; then
+  PKG="sudo apt install"
+elif command -v dnf &>/dev/null; then
+  PKG="sudo dnf install"
+elif command -v pacman &>/dev/null; then
+  PKG="sudo pacman -S"
+elif command -v zypper &>/dev/null; then
+  PKG="sudo zypper install"
+else
+  PKG="<your package manager> install"
+fi
+
 # ── Tool dependency check ─────────────────────────────────────
 REQUIRED_TOOLS=(
   tmux
@@ -16,6 +38,12 @@ REQUIRED_TOOLS=(
   gt
   jq
 )
+
+# Opening the browser on Linux goes through xdg-open; on macOS
+# `open` is always present.
+if [[ "$OS" == "linux" ]]; then
+  REQUIRED_TOOLS+=(xdg-open)
+fi
 
 missing=()
 for tool in "${REQUIRED_TOOLS[@]}"; do
@@ -29,14 +57,17 @@ if [[ ${#missing[@]} -gt 0 ]]; then
   done
   echo ""
   echo "Install hints:"
-  echo "  tmux          → brew install tmux"
-  echo "  fzf           → brew install fzf"
-  echo "  git           → brew install git"
-  echo "  pnpm          → brew install pnpm  OR  https://pnpm.io/installation"
+  echo "  tmux          → $PKG tmux"
+  echo "  fzf           → $PKG fzf"
+  echo "  git           → $PKG git"
+  echo "  pnpm          → $PKG pnpm  OR  https://pnpm.io/installation"
   echo "  code          → https://code.visualstudio.com  (install shell command via Command Palette)"
   echo "  claude        → https://claude.ai/code  (Claude Code CLI)"
   echo "  gt            → npm install -g @withgraphite/graphite-cli"
-  echo "  jq            → brew install jq"
+  echo "  jq            → $PKG jq"
+  if [[ "$OS" == "linux" ]]; then
+    echo "  xdg-open      → $PKG xdg-utils"
+  fi
   echo ""
   echo "Re-run this script after installing missing tools."
   exit 1
@@ -125,7 +156,9 @@ if ! grep -qF "tmux-statusbar.conf" "$HOME/.tmux.conf" 2>/dev/null; then
   echo "Added source line to ~/.tmux.conf"
 fi
 
-if [[ -n "${TMUX:-}" ]] || pgrep -q tmux 2>/dev/null; then
+# `pgrep -q` is a BSD extension and is absent from Linux procps,
+# so redirect instead of relying on the flag.
+if [[ -n "${TMUX:-}" ]] || pgrep tmux >/dev/null 2>&1; then
   tmux source-file "$HOME/.tmux.conf" 2>/dev/null \
     && echo "Reloaded running tmux config."
 fi

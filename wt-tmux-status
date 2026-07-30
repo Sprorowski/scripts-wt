@@ -72,12 +72,40 @@ fi
 
 # ── Liveness ─────────────────────────────────────────────────
 # A dev server is "up" when something is listening on its port.
-# bash's /dev/tcp avoids forking lsof/nc on every status redraw;
-# a local connect either succeeds or is refused immediately.
+#
+# bash's /dev/tcp is the cheapest probe (no fork at all), but it
+# is a compile-time feature — Debian and friends have shipped
+# bash built without net redirections, where the redirect falls
+# through to the filesystem and fails with ENOENT. That looks
+# identical to "connection refused" by exit status alone, so we
+# probe once against a closed port and read the error text: a
+# "no such file" means the feature is missing, not that the port
+# is closed. Without this check every server reads as down.
+# Set WT_PORT_PROBE to devtcp|nc|ss|lsof to override detection.
+probe_kind="${WT_PORT_PROBE:-}"
+if [[ -z "$probe_kind" && -n "${BASH_VERSION:-}" ]]; then
+  if ! { (exec 3<>/dev/tcp/127.0.0.1/1) ; } 2>&1 \
+       | grep -qi "no such file"; then
+    probe_kind="devtcp"
+  fi
+fi
+if [[ -z "$probe_kind" ]]; then
+  if command -v nc  >/dev/null 2>&1; then probe_kind="nc"
+  elif command -v ss   >/dev/null 2>&1; then probe_kind="ss"
+  elif command -v lsof >/dev/null 2>&1; then probe_kind="lsof"
+  fi
+fi
+
 port_up() {
   local p="$1"
   [[ -n "$p" && "$p" != 0 ]] || return 1
-  (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null
+  case "$probe_kind" in
+    devtcp) (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null ;;
+    nc)     nc -z -w 1 127.0.0.1 "$p" >/dev/null 2>&1 ;;
+    ss)     ss -H -ltn "sport = :$p" 2>/dev/null | grep -q . ;;
+    lsof)   lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1 ;;
+    *)      return 1 ;;
+  esac
 }
 
 api_up=0; web_up=0
