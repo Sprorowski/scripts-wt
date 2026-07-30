@@ -3,7 +3,7 @@ set -euo pipefail
 
 INSTALL_DIR="$HOME/.local/bin"
 GITHUB_RAW="https://raw.githubusercontent.com/Sprorowski/scripts-wt/mac"
-SCRIPTS=(tmux-sessionizer wt)
+SCRIPTS=(tmux-sessionizer wt wt-tmux-status)
 
 # ── Tool dependency check ─────────────────────────────────────
 REQUIRED_TOOLS=(
@@ -79,6 +79,56 @@ for script in "${SCRIPTS[@]}"; do
   chmod +x "$dst"
   echo "Installed: $dst"
 done
+
+# ── Status bar config ─────────────────────────────────────────
+TMUX_CONF_DIR="$HOME/.config/wt"
+TMUX_CONF="$TMUX_CONF_DIR/tmux-statusbar.conf"
+mkdir -p "$TMUX_CONF_DIR"
+
+tmp=$(mktemp)
+echo "Fetching tmux-statusbar.conf..."
+if ! curl -fsSL "$GITHUB_RAW/tmux-statusbar.conf" -o "$tmp"; then
+  echo "ERROR: Failed to download tmux-statusbar.conf"
+  exit 1
+fi
+
+if [[ -f "$TMUX_CONF" ]] && diff -q "$tmp" "$TMUX_CONF" &>/dev/null; then
+  echo "Up to date: $TMUX_CONF"
+else
+  if [[ -f "$TMUX_CONF" ]]; then
+    echo ""
+    echo "Changes in 'tmux-statusbar.conf' (incoming → will overwrite installed):"
+    diff --color=always -u "$TMUX_CONF" "$tmp" || true
+    echo ""
+    read -r -p "Overwrite $TMUX_CONF? [Y/n] " answer
+  else
+    answer=""
+  fi
+
+  if [[ "$answer" =~ ^[Nn]$ ]]; then
+    echo "Skipped: tmux-statusbar.conf"
+  else
+    cp "$tmp" "$TMUX_CONF"
+    echo "Installed: $TMUX_CONF"
+  fi
+fi
+rm -f "$tmp"
+
+# Wire it into ~/.tmux.conf if it isn't already.
+SOURCE_LINE="source-file -q ~/.config/wt/tmux-statusbar.conf"
+if ! grep -qF "tmux-statusbar.conf" "$HOME/.tmux.conf" 2>/dev/null; then
+  {
+    echo ""
+    echo "# Status bar (managed by scripts-wt — see tmux-statusbar.conf in that repo)"
+    echo "$SOURCE_LINE"
+  } >> "$HOME/.tmux.conf"
+  echo "Added source line to ~/.tmux.conf"
+fi
+
+if [[ -n "${TMUX:-}" ]] || pgrep -q tmux 2>/dev/null; then
+  tmux source-file "$HOME/.tmux.conf" 2>/dev/null \
+    && echo "Reloaded running tmux config."
+fi
 
 # ── PATH reminder ─────────────────────────────────────────────
 if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then

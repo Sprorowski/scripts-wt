@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"ls -la ~/.tmux.conf ~/.config/tmux/ 2>&1\",\"description\":\"Find tmux configs\"}",
+  "error": "Exit code 1\nls: /Users/sprowsk/.config/tmux/: No such file or directory\n-rw-r--r--@ 1 sprowsk  staff  364 Jul 21 02:35 /Users/sprowsk/.tmux.conf",
+  "timestamp": "2026-07-30T14:17:13.844Z",
+  "retry_count": 1
+}
