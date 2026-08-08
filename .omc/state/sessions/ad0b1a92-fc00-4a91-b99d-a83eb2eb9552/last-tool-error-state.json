@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"grep -oE \\\"^LINEAR[A-Z_]*\\\" ~/workspace/monorepo/apps/api/.env 2>/dev/null; grep -ioE \\\"linear\\\" ~/workspace/monorepo/.mcp.json 2>/dev/null | head -2; jq -r '.mcpServers | keys[]' ~/worksp...",
+  "error": "Exit code 1",
+  "timestamp": "2026-08-07T23:28:46.720Z",
+  "retry_count": 1
+}

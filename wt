@@ -494,6 +494,57 @@ teardown_dev_database() {
   fi
 }
 
+# ── Neon Fork ────────────────────────────────────────────────
+# Each worktree gets its own Neon fork via the repo's rec-neon
+# dispatcher (pnpm db:neon:*), which targets whichever worktree
+# it runs in. The interactive `rec-neon` is a zsh function, so
+# the script calls the dispatcher file directly — preferring the
+# worktree's own copy, falling back to the main repo's.
+
+_rec_neon() {
+  local wt_path="$1"; shift
+  local dispatcher
+  if [[ -f "$wt_path/scripts/neon/rec-neon.sh" ]]; then
+    dispatcher="$wt_path/scripts/neon/rec-neon.sh"
+  elif [[ -f "$REPO_ROOT/scripts/neon/rec-neon.sh" ]]; then
+    dispatcher="$REPO_ROOT/scripts/neon/rec-neon.sh"
+  else
+    return 127
+  fi
+  (cd "$wt_path" && bash "$dispatcher" "$@")
+}
+
+setup_neon_branch() {
+  local wt_path="$1"
+
+  info "Creating Neon fork for this worktree..."
+  local rc=0
+  _rec_neon "$wt_path" fork || rc=$?
+  if [[ "$rc" -eq 127 ]]; then
+    warn "rec-neon dispatcher not found (scripts/neon/rec-neon.sh) — skipping Neon fork"
+    return 1
+  elif [[ "$rc" -ne 0 ]]; then
+    warn "Neon fork failed — run 'rec-neon fork' manually in $wt_path"
+    return 1
+  fi
+  ok "Neon fork ready"
+}
+
+teardown_neon_branch() {
+  local wt_path="$1"
+
+  [[ -d "$wt_path" ]] || return 0
+
+  info "Deleting Neon fork..."
+  local rc=0
+  _rec_neon "$wt_path" delete --yes || rc=$?
+  if [[ "$rc" -eq 127 ]]; then
+    warn "rec-neon dispatcher not found — delete the Neon fork manually if one exists"
+  elif [[ "$rc" -ne 0 ]]; then
+    warn "Neon fork delete failed — run 'rec-neon delete' manually before recreating this worktree"
+  fi
+}
+
 # ── Env File Setup ──────────────────────────────────────────
 setup_env_files() {
   local wt_path="$1"
@@ -640,14 +691,19 @@ setup_claude_code_settings() {
 open_desktop_workspace() {
   local wt_path="$1"
   local web_port="$2"
+  local open_browser="${3:-true}"
 
   local url="http://localhost:$web_port"
   [[ "$web_port" == "0" ]] && return 0
 
   code "$wt_path" &>/dev/null &
-  open_url "$url"
 
-  ok "Workspace opened (VSCode + browser at $url)"
+  if [[ "$open_browser" == true ]]; then
+    open_url "$url"
+    ok "Workspace opened (VSCode + browser at $url)"
+  else
+    ok "Workspace opened (VSCode — browser opens on 'wt switch')"
+  fi
 }
 
 # ── tmux Session ─────────────────────────────────────────────
@@ -657,6 +713,7 @@ create_tmux_session() {
   local api_port="$3"
   local web_port="$4"
   local branch="$5"
+  local silent="${6:-false}"
   local sess
   sess=$(session_name "$name")
 
@@ -676,9 +733,13 @@ create_tmux_session() {
   tmux new-window -t "=$sess" -n "claude" -c "$wt_path"
   tmux send-keys -t "=$sess:claude" "claude" Enter
 
-  # Window 3: VS Code (--wait blocks; Ctrl-C closes the editor)
+  # Window 3: VS Code (in silent mode the command is pre-typed, not run)
   tmux new-window -t "=$sess" -n "vscode" -c "$wt_path"
-  tmux send-keys -t "=$sess:vscode" "code ." Enter
+  if [[ "$silent" == true ]]; then
+    tmux send-keys -t "=$sess:vscode" "code ."
+  else
+    tmux send-keys -t "=$sess:vscode" "code ." Enter
+  fi
 
   # Window 4: API server (command pre-typed but not executed)
   tmux new-window -t "=$sess" -n "api" -c "$wt_path"
@@ -707,6 +768,8 @@ cmd_create() {
   local name=""
   local new_branch=false
   local isolate_org=""
+  local silent=false
+  local no_neon=false
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -714,13 +777,15 @@ cmd_create() {
       -n|--name)   name="$2"; shift 2 ;;
       --new)       new_branch=true; shift ;;
       --org|-o)    isolate_org="$2"; shift 2 ;;
+      --silent)    silent=true; shift ;;
+      --no-neon)   no_neon=true; shift ;;
       -h|--help)   cmd_help; return ;;
       -*)          die "Unknown option: $1" ;;
       *)           branch="$1"; shift ;;
     esac
   done
 
-  [[ -z "$branch" ]] && die "Usage: wt create <branch> [-b <base>] [-n <name>] [--new] [--org <id>]"
+  [[ -z "$branch" ]] && die "Usage: wt create <branch> [-b <base>] [-n <name>] [--new] [--org <id>] [--silent] [--no-neon]"
 
   # Derive name from branch if not provided
   [[ -z "$name" ]] && name=$(name_from_branch "$branch")
@@ -784,13 +849,26 @@ cmd_create() {
   }
   ok "Dependencies installed"
 
+  # Fork the Neon database for this worktree (rec-neon runs via pnpm,
+  # so it needs dependencies installed first)
+  if [[ "$no_neon" == true ]]; then
+    info "Skipping Neon fork (--no-neon)"
+  else
+    setup_neon_branch "$wt_path" || true
+  fi
+
   # Register the worktree
   registry_add "$name" "$branch" "$wt_path" "$api_port" "$web_port"
 
   # Create and start tmux session; desktop setup runs in background so we don't block
-  create_tmux_session "$name" "$wt_path" "$api_port" "$web_port" "$branch"
-  open_desktop_workspace "$wt_path" "$web_port" &
-  echo $! > "$WT_CONFIG_DIR/desktop_bg_$name.pid"
+  create_tmux_session "$name" "$wt_path" "$api_port" "$web_port" "$branch" "$silent"
+  if [[ "$silent" == true ]]; then
+    ok "Silent mode — VSCode and browser not opened"
+  else
+    # VSCode only on create; the browser opens on 'wt switch'
+    open_desktop_workspace "$wt_path" "$web_port" false &
+    echo $! > "$WT_CONFIG_DIR/desktop_bg_$name.pid"
+  fi
 
   # Update terminal tab title to the worktree name
   printf '\033]0;wt/%s\007' "$name"
@@ -840,7 +918,17 @@ cmd_list() {
 cmd_switch() {
   ensure_config
 
-  local name="${1:-}"
+  local name=""
+  local silent=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --silent)  silent=true; shift ;;
+      -h|--help) echo "Usage: wt switch [name] [--silent]"; return ;;
+      -*)        die "Unknown option: $1" ;;
+      *)         name="$1"; shift ;;
+    esac
+  done
 
   # No arg: fzf picker over worktree sessions
   if [[ -z "$name" ]]; then
@@ -875,15 +963,17 @@ cmd_switch() {
     local branch path api_port web_port
     IFS='|' read -r _ branch path api_port web_port <<< "$entry"
     warn "Session not running. Restarting..."
-    create_tmux_session "$name" "$path" "$api_port" "$web_port" "$branch"
+    create_tmux_session "$name" "$path" "$api_port" "$web_port" "$branch" "$silent"
   fi
 
   local _path _web
   IFS='|' read -r _ _ _path _ _web <<< "$entry"
 
   # Background so tmux attach/switch happens immediately; desktop setup follows async
-  open_desktop_workspace "$_path" "$_web" &
-  echo $! > "$WT_CONFIG_DIR/desktop_bg_$name.pid"
+  if [[ "$silent" != true ]]; then
+    open_desktop_workspace "$_path" "$_web" true &
+    echo $! > "$WT_CONFIG_DIR/desktop_bg_$name.pid"
+  fi
 
   # Update terminal tab title to the worktree name
   printf '\033]0;wt/%s\007' "$name"
@@ -918,6 +1008,10 @@ cmd_remove() {
   if tmux kill-session -t "=$sess" 2>/dev/null; then
     ok "tmux session killed"
   fi
+
+  # Delete the Neon fork first — rec-neon targets the worktree it runs
+  # in, so this must happen while the directory still exists
+  teardown_neon_branch "$path"
 
   # Remove git worktree
   if [[ -d "$path" ]]; then
@@ -1452,14 +1546,17 @@ cmd_help() {
   echo "  wt <command> [options]"
   echo ""
   echo -e "${BOLD}COMMANDS${NC}"
-  echo -e "  ${CYAN}create${NC} (c) <branch> [opts]  Create worktree + tmux session with dev servers"
+  echo -e "  ${CYAN}create${NC} (c) <branch> [opts]  Create worktree + tmux session + Neon fork (opens VSCode, no browser)"
   echo "        -b, --base <ref>     Create new branch from <ref>"
   echo "        -n, --name <name>    Override the worktree name"
   echo "        --new                Create branch from main (shorthand for -b main)"
+  echo "        --silent             Only worktree + tmux session (no VSCode, no browser)"
+  echo "        --no-neon            Skip the Neon fork"
   echo ""
   echo -e "  ${CYAN}list${NC}    (ls)              List all worktrees with ports and status"
-  echo -e "  ${CYAN}switch${NC}  (s)  [name]       Switch to worktree (fzf picker if no name)"
-  echo -e "  ${CYAN}remove${NC}  (rm) <name>       Stop servers and remove worktree"
+  echo -e "  ${CYAN}switch${NC}  (s)  [name]       Switch to worktree (opens VSCode + browser; fzf picker if no name)"
+  echo "        --silent             Attach to tmux only (no VSCode, no browser)"
+  echo -e "  ${CYAN}remove${NC}  (rm) <name>       Stop servers, delete Neon fork, remove worktree"
   echo -e "  ${CYAN}restart${NC}      <name>       Restart dev servers for a worktree"
   echo -e "  ${CYAN}stop${NC}         <name>       Stop dev servers (keep worktree)"
   echo -e "  ${CYAN}supervise${NC}    [stack]       Launch PR Supervisor (autonomous Sentry fixer)"
@@ -1474,6 +1571,7 @@ cmd_help() {
   echo "  wt create feature/payments           # Existing branch"
   echo "  wt create fix/login-bug --new        # New branch from main"
   echo "  wt create fix/login -b develop       # New branch from develop"
+  echo "  wt create fix/login --new --silent   # No VSCode, no browser"
   echo "  wt create migrations/v2 --org abc123 # Create + isolate DB in one step"
   echo "  wt switch                            # fzf picker"
   echo "  wt switch login-bug                  # Direct switch"

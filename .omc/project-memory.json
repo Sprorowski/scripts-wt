@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "lastScanned": 1785419953708,
+  "lastScanned": 1786144108395,
   "projectRoot": "/Users/sprowsk/workspace/scripts-wt",
   "techStack": {
     "languages": [],
@@ -34,6 +34,12 @@
   "directoryMap": {},
   "hotPaths": [
     {
+      "path": "wt",
+      "accessCount": 22,
+      "lastAccessed": 1786144794836,
+      "type": "file"
+    },
+    {
       "path": "tmux-statusbar.conf",
       "accessCount": 9,
       "lastAccessed": 1785426661122,
@@ -49,12 +55,6 @@
       "path": "wt-tmux-status",
       "accessCount": 7,
       "lastAccessed": 1785426825125,
-      "type": "file"
-    },
-    {
-      "path": "wt",
-      "accessCount": 6,
-      "lastAccessed": 1785426602956,
       "type": "file"
     },
     {
