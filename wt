@@ -514,12 +514,41 @@ _rec_neon() {
   (cd "$wt_path" && bash "$dispatcher" "$@")
 }
 
+# Region for new forks: rec-neon reads the `# Region:` header from the
+# CURRENT worktree's .env.neon, but a fresh worktree doesn't have one yet —
+# so wt seeds the region from the MAIN worktree's header via --region
+# (sticky: fork records it in the new worktree's .env.neon).
+_neon_main_region() {
+  sed -n '/^# Region:/{s/^# Region:[[:space:]]*//;p;q;}' "$REPO_ROOT/apps/api/.env.neon" 2>/dev/null || true
+}
+
 setup_neon_branch() {
   local wt_path="$1"
 
-  info "Creating Neon fork for this worktree..."
+  local fork_args=(fork)
+  local region
+  region=$(_neon_main_region)
+  if [[ -n "$region" ]]; then
+    if grep -qi "region" "$wt_path/scripts/neon/_common.sh" 2>/dev/null; then
+      fork_args+=(--region "$region")
+      # Seed the region header BEFORE forking: fork's sub-steps (url.sh) and a
+      # later delete resolve the region from THIS worktree's .env.neon, which
+      # otherwise doesn't exist yet on a first fork and falls back to the
+      # default region — pointing at the wrong Neon project.
+      if [[ ! -f "$wt_path/apps/api/.env.neon" ]]; then
+        printf '# Region: %s\n' "$region" > "$wt_path/apps/api/.env.neon"
+      fi
+      info "Creating Neon fork for this worktree (region: ${CYAN}$region${NC})..."
+    else
+      warn "Main .env.neon requests region '$region' but this worktree's neon scripts predate region support — forking in the default region"
+      info "Creating Neon fork for this worktree..."
+    fi
+  else
+    info "Creating Neon fork for this worktree..."
+  fi
+
   local rc=0
-  _rec_neon "$wt_path" fork || rc=$?
+  _rec_neon "$wt_path" "${fork_args[@]}" || rc=$?
   if [[ "$rc" -eq 127 ]]; then
     warn "rec-neon dispatcher not found (scripts/neon/rec-neon.sh) — skipping Neon fork"
     return 1
@@ -775,17 +804,17 @@ cmd_create() {
     case "$1" in
       -b|--base)   base="$2"; shift 2 ;;
       -n|--name)   name="$2"; shift 2 ;;
-      --new)       new_branch=true; shift ;;
+      -N|--new)    new_branch=true; shift ;;
       --org|-o)    isolate_org="$2"; shift 2 ;;
-      --silent)    silent=true; shift ;;
-      --no-neon)   no_neon=true; shift ;;
+      -s|--silent) silent=true; shift ;;
+      -x|--no-neon) no_neon=true; shift ;;
       -h|--help)   cmd_help; return ;;
       -*)          die "Unknown option: $1" ;;
       *)           branch="$1"; shift ;;
     esac
   done
 
-  [[ -z "$branch" ]] && die "Usage: wt create <branch> [-b <base>] [-n <name>] [--new] [--org <id>] [--silent] [--no-neon]"
+  [[ -z "$branch" ]] && die "Usage: wt create <branch> [-b <base>] [-n <name>] [-N|--new] [--org <id>] [-s|--silent] [-x|--no-neon]"
 
   # Derive name from branch if not provided
   [[ -z "$name" ]] && name=$(name_from_branch "$branch")
@@ -923,8 +952,8 @@ cmd_switch() {
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --silent)  silent=true; shift ;;
-      -h|--help) echo "Usage: wt switch [name] [--silent]"; return ;;
+      -s|--silent) silent=true; shift ;;
+      -h|--help) echo "Usage: wt switch [name] [-s|--silent]"; return ;;
       -*)        die "Unknown option: $1" ;;
       *)         name="$1"; shift ;;
     esac
@@ -969,6 +998,12 @@ cmd_switch() {
   local _path _web
   IFS='|' read -r _ _ _path _ _web <<< "$entry"
 
+  # The rec CLI repoints ports when it adopts a worktree (rec up), so trust
+  # the worktree's env over wt's registry for the browser URL.
+  local live_web
+  live_web=$(grep -E "^WEB_PORT=" "$_path/apps/web/.env" 2>/dev/null | head -1 | cut -d= -f2 | sed 's/ *#.*//' || true)
+  [[ -n "$live_web" ]] && _web="$live_web"
+
   # Background so tmux attach/switch happens immediately; desktop setup follows async
   if [[ "$silent" != true ]]; then
     open_desktop_workspace "$_path" "$_web" true &
@@ -1008,6 +1043,10 @@ cmd_remove() {
   if tmux kill-session -t "=$sess" 2>/dev/null; then
     ok "tmux session killed"
   fi
+
+  # Stop the rec-managed stack while the directory still exists — otherwise
+  # its detached daemon keeps the dev servers (and ports) alive
+  stop_rec_stack "$path"
 
   # Delete the Neon fork first — rec-neon targets the worktree it runs
   # in, so this must happen while the directory still exists
@@ -1053,6 +1092,18 @@ cmd_restart() {
   create_tmux_session "$name" "$path" "$api_port" "$web_port" "$branch"
 }
 
+# Stop the worktree's process-compose stack if the rec CLI manages one.
+# Killing the tmux session does NOT stop it — rec up runs a detached daemon,
+# so without this the dev servers keep running and their ports stay bound.
+stop_rec_stack() {
+  local wt_path="$1"
+  command -v rec &>/dev/null || return 0
+  [[ -d "$wt_path" ]] || return 0
+  if (cd "$wt_path" && rec down &>/dev/null); then
+    ok "rec stack stopped"
+  fi
+}
+
 kill_desktop_bg() {
   local name="$1"
   local pid_file="$WT_CONFIG_DIR/desktop_bg_$name.pid"
@@ -1069,6 +1120,14 @@ cmd_stop() {
   [[ -z "$name" ]] && die "Usage: wt stop <name>"
 
   kill_desktop_bg "$name"
+
+  # Stop the rec-managed stack too — killing tmux alone leaves it running
+  local entry _path
+  entry=$(registry_get "$name")
+  if [[ -n "$entry" ]]; then
+    IFS='|' read -r _ _ _path _ _ <<< "$entry"
+    stop_rec_stack "$_path"
+  fi
 
   local sess
   sess=$(session_name "$name")
@@ -1504,12 +1563,12 @@ cmd_isolatedb() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --org|-o)    org_id="$2"; shift 2 ;;
-      --reset)     reset=true; shift ;;
+      -r|--reset)  reset=true; shift ;;
       -h|--help)
-        echo "Usage: wt isolatedb [name] --org <org_id> [--reset]"
-        echo "  name       Worktree name (defaults to current worktree)"
-        echo "  --org      Organization ID to scope the data copy to"
-        echo "  --reset    Drop and recreate an existing isolated DB"
+        echo "Usage: wt isolatedb [name] --org <org_id> [-r|--reset]"
+        echo "  name        Worktree name (defaults to current worktree)"
+        echo "  --org, -o   Organization ID to scope the data copy to"
+        echo "  --reset, -r Drop and recreate an existing isolated DB"
         return ;;
       -*)          die "Unknown option: $1" ;;
       *)           name="$1"; shift ;;
@@ -1538,6 +1597,225 @@ cmd_isolatedb() {
   setup_isolated_dev_db "$name" "$org_id" "$wt_path" "$reset"
 }
 
+# ── Start Cycle ──────────────────────────────────────────────
+# Pulls your unstarted issues from the active Linear cycle (via a
+# headless claude call using the linear-server MCP), creates one
+# worktree per standalone task and one shared worktree per project,
+# then kicks off claude in each with `/start-task <ISSUE-ID>`.
+
+fetch_cycle_tasks() {
+  local team="$1"
+  local team_clause=""
+  [[ -n "$team" ]] && team_clause=" Only include issues from the team with key '$team'."
+
+  local prompt="Using the linear-server MCP tools, find the currently active cycle and list the issues in it that are assigned to me and not started yet (state type 'unstarted' or 'backlog', e.g. Todo).${team_clause}
+
+Output ONLY a JSON array — no markdown fences, no prose before or after it. Each element must be:
+{\"identifier\":\"CON-470\",\"title\":\"...\",\"url\":\"...\",\"branchName\":\"<the issue's git branch name from Linear>\",\"sortOrder\":<number>,\"estimate\":<the issue's estimate points as a number>,\"project\":{\"name\":\"...\",\"slug\":\"<kebab-case project name>\"}}
+Use null for \"project\" when the issue has no project, and for \"branchName\"/\"sortOrder\"/\"estimate\" when unavailable. If no issues match, output []."
+
+  # Run from the main repo so the project-scoped linear-server MCP applies.
+  # --output-format json wraps the answer in metadata; .result is the text.
+  local raw
+  raw=$( (cd "$REPO_ROOT" && DISABLE_OMC=1 claude -p "$prompt" \
+      --output-format json --allowedTools "mcp__linear-server" 2>/dev/null) || true )
+  [[ -z "$raw" ]] && return 1
+  printf '%s' "$raw" | jq -r '.result // empty' 2>/dev/null | sed -e 's/^```json *$//' -e 's/^``` *$//'
+}
+
+# Keep letters/digits/._- (preserving case); everything else becomes '-'.
+sanitize_wt_name() {
+  echo "$1" | sed -e 's/[^A-Za-z0-9._-]/-/g' -e 's/^-*//' -e 's/-*$//'
+}
+
+# Send `/start-task <issue>` into a worktree's claude tmux window.
+kickoff_task() {
+  local name="$1" issue_id="$2"
+  local sess
+  sess=$(session_name "$name")
+  tmux has-session -t "=$sess" 2>/dev/null || { warn "No session for '$name' — kick off manually: /start-task $issue_id"; return 1; }
+
+  # Wait for claude to be up in the claude window; if the window sits at a
+  # shell (older session, or claude exited), relaunch claude in it once.
+  local waited=0 launched=false cmd
+  while true; do
+    cmd=$(tmux display-message -t "=$sess:claude" -p "#{pane_current_command}" 2>/dev/null) || cmd=""
+    case "$cmd" in
+      node|claude) break ;;
+      zsh|bash|sh|-zsh|-bash)
+        if [[ "$launched" == false && "$waited" -ge 3 ]]; then
+          tmux send-keys -t "=$sess:claude" "claude" Enter
+          launched=true
+        fi ;;
+    esac
+    if [[ "$waited" -ge 45 ]]; then
+      warn "claude window in '$sess' not ready — kick off manually: /start-task $issue_id"
+      return 1
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  sleep 2  # let the TUI finish rendering before typing
+
+  tmux send-keys -t "=$sess:claude" -l "/start-task $issue_id"
+  sleep 1
+  # The first Enter may only accept the slash-command autocomplete; a second
+  # Enter on an already-submitted (empty) input is a no-op, so send both.
+  tmux send-keys -t "=$sess:claude" Enter
+  sleep 1
+  tmux send-keys -t "=$sess:claude" Enter
+  ok "Kicked off ${CYAN}$issue_id${NC} in '$sess'"
+}
+
+cmd_start_cycle() {
+  require_cmd tmux
+  require_cmd git
+  require_cmd pnpm
+  require_cmd jq
+  require_cmd claude
+  ensure_config
+
+  local dry_run=false no_kickoff=false no_neon=false team=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -d|--dry-run)    dry_run=true; shift ;;
+      -k|--no-kickoff) no_kickoff=true; shift ;;
+      -x|--no-neon)    no_neon=true; shift ;;
+      -t|--team)       team="$2"; shift 2 ;;
+      -h|--help)    echo "Usage: wt start-cycle [-d|--dry-run] [-k|--no-kickoff] [-x|--no-neon] [-t|--team <key>]"; return ;;
+      -*)           die "Unknown option: $1" ;;
+      *)            die "start-cycle takes no positional arguments" ;;
+    esac
+  done
+
+  info "Fetching your unstarted issues in the active cycle from Linear (headless claude, ~30s)..."
+  local json
+  json=$(fetch_cycle_tasks "$team") || json=""
+  if ! echo "$json" | jq -e 'type == "array"' &>/dev/null; then
+    err "Could not get a valid issue list from Linear. Raw output:"
+    echo "$json" | head -10 >&2
+    die "Try again, or check that the linear-server MCP is authenticated (run 'claude' in $REPO_ROOT and use /mcp)."
+  fi
+
+  local count
+  count=$(echo "$json" | jq 'length')
+  if [[ "$count" -eq 0 ]]; then
+    ok "No unstarted issues assigned to you in the active cycle — nothing to do."
+    return
+  fi
+
+  # Group into worktree units:
+  #   standalone task → unit per issue (name = identifier)
+  #   project task    → one unit per project (name = project slug),
+  #                     first task by sortOrder is the kickoff task
+  local units
+  units=$(echo "$json" | jq -r '
+    def slug: ascii_downcase | gsub("[^a-z0-9]+"; "-") | gsub("^-+|-+$"; "") | .[0:40] | gsub("-+$"; "");
+    # Bug Triage issues are one-off fixes — treat them as projectless so each
+    # gets its own per-task worktree instead of a shared bug-triage one.
+    map(if ((.project.slug // "") | ascii_downcase) == "bug-triage"
+         or ((.project.name // "") | ascii_downcase) == "bug triage"
+        then .project = null else . end)
+    | ([.[] | select(.project == null)]
+      | map({name: .identifier,
+             branch: (if (.branchName // "") == ""
+                      then ((.identifier | ascii_downcase) + "-" + (.title | slug))
+                      else .branchName end),
+             first: .identifier, count: 1, rest: "-",
+             est: (if .estimate == null then "?" else (.estimate | tostring) end),
+             title: .title}))
+    +
+    ([.[] | select(.project != null)]
+      | group_by(.project.slug)
+      | map(sort_by(.sortOrder // 0)
+          | {name: .[0].project.slug, branch: .[0].project.slug,
+             first: .[0].identifier, count: length,
+             rest: (map(.identifier) | .[1:] | join(",") | if . == "" then "-" else . end),
+             est: ((map(.estimate // 0) | add | tostring)
+                   + (if any(.[]; .estimate == null) then "?" else "" end)),
+             title: (.[0].project.name + " · first: " + .[0].title)}))
+    | .[] | [.name, .branch, .first, (.count|tostring), .rest, .est, .title] | @tsv')
+
+  local total_pts noest
+  total_pts=$(echo "$json" | jq '[.[].estimate // 0] | add // 0')
+  noest=$(echo "$json" | jq -r '[.[] | select(.estimate == null) | .identifier] | join(", ")')
+
+  echo ""
+  echo -e "${BOLD}Plan${NC} ${DIM}($count issue(s) · ${total_pts} pts total)${NC}"
+  [[ -n "$noest" ]] && echo -e "  ${YELLOW}! no estimate on: $noest${NC}"
+  echo -e "${DIM}──────────────────────────────────────────────────────────────${NC}"
+  local name branch first tcount rest est title
+  while IFS=$'\t' read -r name branch first tcount rest est title; do
+    [[ -z "$name" ]] && continue
+    name=$(sanitize_wt_name "$name")
+    [[ "$rest" == "-" ]] && rest=""
+    local mark="new"
+    [[ -n "$(registry_get "$name")" ]] && mark="reuse"
+    if [[ "$est" == *"?"* ]]; then
+      printf "  ${CYAN}%-24s${NC} %-9s ${YELLOW}pts:%-4s${NC} kickoff:${GREEN}%-10s${NC} %s task(s)  %s\n" "$name" "[$mark]" "$est" "$first" "$tcount" "$title"
+    else
+      printf "  ${CYAN}%-24s${NC} %-9s pts:%-4s kickoff:${GREEN}%-10s${NC} %s task(s)  %s\n" "$name" "[$mark]" "$est" "$first" "$tcount" "$title"
+    fi
+    echo -e "  ${DIM}                         branch: $branch${NC}"
+    [[ -n "$rest" ]] && echo -e "  ${DIM}                         queued: $rest${NC}"
+  done <<< "$units"
+  echo ""
+
+  [[ "$dry_run" == true ]] && { info "Dry run — nothing created."; return; }
+
+  local ledger="$WT_CONFIG_DIR/kickoffs"
+  touch "$ledger"
+
+  local created=0 reused=0 failed=0 kicked=0 skipped=0
+  while IFS=$'\t' read -r name branch first tcount rest est title; do
+    [[ -z "$name" ]] && continue
+    name=$(sanitize_wt_name "$name")
+    [[ "$rest" == "-" ]] && rest=""
+
+    if [[ -n "$(registry_get "$name")" ]]; then
+      # Reuse: make sure the tmux session is alive (silently)
+      local entry rbranch rpath rapi rweb
+      entry=$(registry_get "$name")
+      IFS='|' read -r _ rbranch rpath rapi rweb <<< "$entry"
+      if ! tmux has-session -t "=$(session_name "$name")" 2>/dev/null; then
+        create_tmux_session "$name" "$rpath" "$rapi" "$rweb" "$rbranch" true
+      fi
+      ok "Reusing worktree '${CYAN}$name${NC}'"
+      reused=$((reused + 1))
+    else
+      info "Creating worktree '${BOLD}$name${NC}' (branch: $branch)..."
+      local create_args=("$branch" --name "$name" --silent)
+      # --new only when the branch doesn't exist yet
+      git -C "$REPO_ROOT" rev-parse --verify "$branch" &>/dev/null || create_args+=(--new)
+      [[ "$no_neon" == true ]] && create_args+=(--no-neon)
+      # Run in a child process so a failed create doesn't kill the loop
+      if "$0" create "${create_args[@]}"; then
+        created=$((created + 1))
+      else
+        err "Create failed for '$name' — skipping its kickoff"
+        failed=$((failed + 1))
+        continue
+      fi
+    fi
+
+    if [[ "$no_kickoff" == true ]]; then
+      :
+    elif grep -qxF "$first" "$ledger" 2>/dev/null; then
+      info "$first already kicked off before — skipping (ledger: $ledger)"
+      skipped=$((skipped + 1))
+    elif kickoff_task "$name" "$first"; then
+      echo "$first" >> "$ledger"
+      kicked=$((kicked + 1))
+    fi
+
+    [[ -n "$rest" ]] && echo -e "  ${DIM}Queued in '$name' (start with /start-task): $rest${NC}"
+  done <<< "$units"
+
+  echo ""
+  echo -e "${GREEN}${BOLD}Cycle started.${NC} Worktrees: $created created, $reused reused, $failed failed. Kickoffs: $kicked sent, $skipped already done."
+  echo -e "  Jump in:  ${CYAN}wt switch${NC}  (fzf picker)"
+}
+
 cmd_help() {
   echo ""
   echo -e "${BOLD}wt${NC} — Git worktree manager with tmux + dev servers"
@@ -1549,13 +1827,18 @@ cmd_help() {
   echo -e "  ${CYAN}create${NC} (c) <branch> [opts]  Create worktree + tmux session + Neon fork (opens VSCode, no browser)"
   echo "        -b, --base <ref>     Create new branch from <ref>"
   echo "        -n, --name <name>    Override the worktree name"
-  echo "        --new                Create branch from main (shorthand for -b main)"
-  echo "        --silent             Only worktree + tmux session (no VSCode, no browser)"
-  echo "        --no-neon            Skip the Neon fork"
+  echo "        -N, --new            Create branch from main (shorthand for -b main)"
+  echo "        -s, --silent         Only worktree + tmux session (no VSCode, no browser)"
+  echo "        -x, --no-neon        Skip the Neon fork"
   echo ""
   echo -e "  ${CYAN}list${NC}    (ls)              List all worktrees with ports and status"
   echo -e "  ${CYAN}switch${NC}  (s)  [name]       Switch to worktree (opens VSCode + browser; fzf picker if no name)"
-  echo "        --silent             Attach to tmux only (no VSCode, no browser)"
+  echo "        -s, --silent         Attach to tmux only (no VSCode, no browser)"
+  echo -e "  ${CYAN}start-cycle${NC} (sc) [opts]    Worktrees + claude kickoff for your unstarted Linear cycle tasks"
+  echo "        -d, --dry-run        Show the plan without creating anything"
+  echo "        -k, --no-kickoff     Create worktrees only; don't send /start-task"
+  echo "        -x, --no-neon        Skip Neon forks"
+  echo "        -t, --team <key>     Limit to one Linear team (e.g. CON)"
   echo -e "  ${CYAN}remove${NC}  (rm) <name>       Stop servers, delete Neon fork, remove worktree"
   echo -e "  ${CYAN}restart${NC}      <name>       Restart dev servers for a worktree"
   echo -e "  ${CYAN}stop${NC}         <name>       Stop dev servers (keep worktree)"
@@ -1564,7 +1847,7 @@ cmd_help() {
   echo -e "  ${CYAN}isolatedb${NC} (idb) [name]     Create isolated dev DB scoped to one org"
   echo -e "  ${CYAN}dropdb${NC}       [name]        Drop isolated dev DB and restore shared DB URL"
   echo "        --org, -o <id>       Org ID to copy data for (required)"
-  echo "        --reset              Drop and recreate existing isolated DB"
+  echo "        -r, --reset          Drop and recreate existing isolated DB"
   echo -e "  ${CYAN}help${NC}                      Show this help"
   echo ""
   echo -e "${BOLD}EXAMPLES${NC}"
@@ -1628,6 +1911,7 @@ main() {
     remove|rm)       cmd_remove "$@" ;;
     restart)         cmd_restart "$@" ;;
     stop)            cmd_stop "$@" ;;
+    start-cycle|start_cycle|sc) cmd_start_cycle "$@" ;;
     supervise|sv)    cmd_supervise "$@" ;;
     status|st)       cmd_status "$@" ;;
     isolatedb|idb)   cmd_isolatedb "$@" ;;
